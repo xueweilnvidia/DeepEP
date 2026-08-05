@@ -46,19 +46,36 @@ GPU0  GPU1  GPU2  GPU3          GPU4  GPU5  GPU6  GPU7
 
 ## 环境搭建
 
-### 1. 安装 Conda（如未安装）
+### 1. 准备 Python 和编译工具
+
+确保系统已安装 Python 3.12、`venv`、Python 开发头文件和基本编译工具。以下命令适用于软件源中已提供 Python 3.12 的 Debian/Ubuntu 环境：
 
 ```bash
-wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
-bash Miniforge3-Linux-x86_64.sh -b -p $HOME/miniforge3
-source $HOME/miniforge3/etc/profile.d/conda.sh
+sudo apt-get update
+sudo apt-get install -y \
+  python3.12 python3.12-venv python3.12-dev \
+  build-essential ninja-build git
 ```
 
-### 2. 创建 Conda 环境
+如果当前发行版的软件源没有 Python 3.12，请先通过该发行版支持的软件源或系统镜像安装 Python 3.12，然后确认：
 
 ```bash
-conda create -n deepep python=3.12 -y
-conda activate deepep
+python3.12 --version
+```
+
+### 2. 创建 Python venv
+
+```bash
+python3.12 -m venv "$HOME/venvs/deepep"
+source "$HOME/venvs/deepep/bin/activate"
+
+python -m pip install --upgrade pip setuptools wheel ninja
+```
+
+后续所有 `python` 和 `pip` 命令都应在这个 venv 激活后执行。重新登录或打开新终端后，使用以下命令重新激活：
+
+```bash
+source "$HOME/venvs/deepep/bin/activate"
 ```
 
 ### 3. 安装 PyTorch
@@ -66,7 +83,7 @@ conda activate deepep
 安装与 CUDA 版本匹配的 PyTorch：
 
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu130
+python -m pip install torch --index-url https://download.pytorch.org/whl/cu130
 ```
 
 验证安装：
@@ -126,7 +143,7 @@ export EP_NCCL_ROOT_DIR=/path/to/nccl/build
 
 NVSHMEM 头文件和库在编译时需要（用于 legacy 内核），纯 PCIe 模式运行时**不会使用** NVSHMEM。
 
-PyTorch ≥ 2.12 的 pip 包自带 `nvidia-nvshmem-cu13`，DeepEP 的构建系统会自动检测到，**无需手动安装或设置环境变量**。
+PyTorch ≥ 2.12 的 pip 包可能自带 `nvidia-nvshmem-cu13`，DeepEP 的构建系统会自动检测 Python 包；也支持自动检测通过 apt 安装在系统多架构目录中的 NVSHMEM。
 
 验证 NVSHMEM 已随 pip 安装：
 ```bash
@@ -135,14 +152,14 @@ python -c "import nvidia.nvshmem; print('NVSHMEM path:', nvidia.nvshmem.__path__
 
 如果 PyTorch 版本较低未自带 NVSHMEM，需手动安装 NVSHMEM ≥ 2.11 并设置：
 ```bash
-export NVSHMEM_ROOT=/path/to/nvshmem
+export EP_NVSHMEM_ROOT_DIR=/path/to/nvshmem
 ```
 
 ### 6. 安装其他依赖
 
 测试脚本需要 numpy：
 ```bash
-pip install numpy
+python -m pip install numpy
 ```
 
 ## 编译安装
@@ -152,7 +169,7 @@ git clone https://github.com/MengYu10151/DeepEP.git
 cd DeepEP
 git checkout pcie-no-atomic
 
-pip install --no-build-isolation -e .
+python -m pip install --no-build-isolation -e .
 ```
 
 > **注意**：必须加 `--no-build-isolation`，否则 pip 会在隔离环境中编译，找不到 PyTorch 导致报错 `No module named 'torch'`。
@@ -315,8 +332,8 @@ barrier 等待 peer rank 超时。检查 EP 组内所有 GPU 是否在同一 NCC
 ### 编译失败 "No module named 'torch'"
 确保使用 `--no-build-isolation` 选项编译：
 ```bash
-conda activate deepep
-pip install --no-build-isolation -e .
+source "$HOME/venvs/deepep/bin/activate"
+python -m pip install --no-build-isolation -e .
 ```
 
 ### JIT 编译失败 "Arguments mismatch for instruction 'mov'"

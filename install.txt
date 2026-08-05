@@ -1,0 +1,777 @@
+## 1. 目标机器检查基础环境
+
+  nvidia-smi
+  nvcc --version
+  python3.12 --version
+  python3.12 -m pip --version
+
+  推荐条件：
+
+  - GPU：H100/H800，Compute Capability 9.0
+  - 驱动：支持 CUDA 13.x
+  - CUDA Toolkit：13.0/13.2
+  - Python：3.12
+  - PyTorch：2.12，且 CUDA 版本与本地 Toolkit 兼容
+  - NCCL：不低于 2.30.4
+
+  安装编译工具：
+
+  sudo apt-get update
+  sudo apt-get install -y \
+    build-essential \
+    git \
+    ninja-build \
+    python3.12-dev
+
+  如果 python3.12 或 pip 尚未安装，需要先通过目标系统的软件源或基础镜像提供。
+
+  ## 2. 获取源码并应用修改
+
+  git clone https://github.com/MengYu10151/DeepEP.git
+  cd DeepEP
+
+  git checkout 67bf8f3c3e499e22029141ff152e9e6474f9952e
+  git submodule update --init --recursive
+
+  应用从原机器带来的 patch：
+
+  git apply --check /path/to/deepep-install-fixes.patch
+  git apply /path/to/deepep-install-fixes.patch
+
+  确认 8 个修改已存在：
+
+  git status --short
+
+  ## 3. 配置用户级 Python 安装
+
+  确认 Python 会加载用户 site-packages：
+
+  python3.12 - <<'PY'
+  import site
+
+  print("User site:", site.getusersitepackages())
+  print("Enabled:", site.ENABLE_USER_SITE)
+  PY
+
+  Enabled 应为 True。
+
+  安装基础 Python 包：
+
+  python3.12 -m pip install --user --upgrade \
+    setuptools \
+    wheel \
+    ninja \
+    numpy
+
+  不要使用 sudo pip install。
+
+  如果出现 externally-managed-environment，可在 pip 命令后增加：
+
+  --break-system-packages
+
+  例如：
+
+  python3.12 -m pip install \
+    --user \
+    --break-system-packages \
+    numpy
+
+  这只应在系统明确启用 PEP 668 时使用。
+
+  ## 4. 安装或验证 PyTorch
+
+  如果目标环境已经提供 PyTorch，先不要重新安装：
+
+  python3.12 - <<'PY'
+  import torch
+  from torch.utils.cpp_extension import CUDA_HOME
+
+  print("PyTorch:", torch.__version__)
+  print("PyTorch CUDA:", torch.version.cuda)
+  print("CUDA_HOME:", CUDA_HOME)
+  print("CUDA available:", torch.cuda.is_available())
+
+  if torch.cuda.is_available():
+      print("GPU:", torch.cuda.get_device_name(0))
+      print("Capability:", torch.cuda.get_device_capability(0))
+  PY
+
+  H100/H800 的 capability 应为：
+
+  (9, 0)
+
+  如果没有 PyTorch，可安装 CUDA 13 对应版本：
+
+  python3.12 -m pip install --user \
+    torch \
+    --index-url https://download.pytorch.org/whl/cu130
+
+  然后重新执行上面的验证。
+
+  ## 5. 安装 NVSHMEM
+
+  当前验证过的版本：
+
+  python3.12 -m pip install --user \
+    nvidia-cuda-cccl==13.3.3.4.1 \
+    nvidia-nvshmem-cu13==3.6.5
+
+  检查：
+
+  python3.12 - <<'PY'
+  import nvidia.nvshmem
+  from pathlib import Path
+
+  root = Path(nvidia.nvshmem.__path__[0])
+  print("NVSHMEM root:", root)
+  print("Header exists:", (root / "include/nvshmem.h").is_file())
+  print("Device library exists:", (root / "lib/libnvshmem_device.a").is_file())
+  print("Host libraries:", list((root / "lib").glob("libnvshmem_host.so*")))
+  PY
+
+  所有必要文件都应该存在。
+
+  ## 6. 配置 NCCL
+
+  ### 情况 A：PyTorch 使用系统 NCCL
+
+  这是当前机器验证成功的方式。
+
+  安装 runtime 和开发包：
+
+  sudo apt-get install -y libnccl2 libnccl-dev
+
+  检查版本和文件：
+
+  dpkg-query -W libnccl2 libnccl-dev
+
+  test -f /usr/include/nccl.h
+  test -e /usr/lib/x86_64-linux-gnu/libnccl.so
+  test -e /usr/lib/x86_64-linux-gnu/libnccl.so.2
+
+  两个包版本必须相同，并且不低于 2.30.4。
+
+  ### 情况 B：PyTorch 自带 pip NCCL
+
+  检查：
+
+  python3.12 -m pip show nvidia-nccl-cu13
+
+  获取路径：
+
+  NCCL_PACKAGE_ROOT="$(python3.12 -c \
+    'import nvidia.nccl; print(nvidia.nccl.__path__[0])')"
+
+  echo "$NCCL_PACKAGE_ROOT"
+
+  确保它包含头文件和库：
+
+  test -f "$NCCL_PACKAGE_ROOT/include/nccl.h"
+  test -e "$NCCL_PACKAGE_ROOT/lib/libnccl.so.2"
+
+  部分 NCCL wheel 只有 libnccl.so.2，当前自动探测还要求存在 libnccl.so。缺少时创建用户目录内的链接：
+
+  if [ ! -e "$NCCL_PACKAGE_ROOT/lib/libnccl.so" ]; then
+    ln -s libnccl.so.2 "$NCCL_PACKAGE_ROOT/lib/libnccl.so"
+  fi
+
+  指定构建路径：
+
+  export EP_NCCL_ROOT_DIR="$NCCL_PACKAGE_ROOT"
+
+  不要让 PyTorch 加载 pip NCCL、DeepEP 却链接另一版本的系统 NCCL，否则 import deep_ep 会报告 NCCL 二进制不一致。
+
+  验证 PyTorch 看到的 NCCL 版本：
+
+  python3.12 -c \
+    "import torch; print('NCCL:', torch.cuda.nccl.version())"
+
+  ## 7. 设置编译环境
+
+  H100/H800：
+
+  export CUDA_HOME=/usr/local/cuda
+  export TORCH_CUDA_ARCH_LIST=9.0
+
+  确认：
+
+  "$CUDA_HOME/bin/nvcc" --version
+
+  如果 NVSHMEM 安装在自定义目录，而不是 pip 用户目录：
+
+  export EP_NVSHMEM_ROOT_DIR=/home/xueweil/.local/lib/python3.12/site-packages/nvidia/nvshmem
+
+  ## 8. 编译前检查依赖探测
+
+  在 DeepEP 仓库根目录运行：
+
+  python3.12 - <<'PY'
+  import importlib.util
+
+  spec = importlib.util.spec_from_file_location(
+      "find_pkgs", "deep_ep/utils/find_pkgs.py"
+  )
+  module = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(module)
+
+  print("NCCL include:  ", module.find_nccl_include_dir())
+  print("NCCL library:  ", module.find_nccl_lib_dir())
+  print("NVSHMEM include:", module.find_nvshmem_include_dir())
+  print("NVSHMEM library:", module.find_nvshmem_lib_dir())
+  PY
+
+  四项都必须打印正确路径，不能报错。
+
+  ## 9. 编译安装 DeepEP
+
+  pip install --no-build-isolation -e .
+
+  注意：
+
+  - 必须保留 --no-build-isolation。
+  - -e 是 editable 安装，之后不能移动或删除这个源码目录。
+  - 构建日志中的 NCCL/NVSHMEM 路径应与上一步一致。
+  - H100 的 Arch list 应显示 9.0。
+
+  ## 10. 验证安装
+
+  python3.12 - <<'PY'
+  import importlib.util
+  import deep_ep
+  import torch
+
+  print("DeepEP:", deep_ep.__version__)
+  print("DeepEP source:", deep_ep.__file__)
+  print("Extension:", importlib.util.find_spec("deep_ep._C").origin)
+  print("PyTorch:", torch.__version__)
+  print("CUDA:", torch.version.cuda)
+  PY
+
+  检查动态链接：
+
+  DEEP_EP_SO="$(python3.12 -c \
+    'import importlib.util; print(importlib.util.find_spec("deep_ep._C").origin)')"
+
+  ldd "$DEEP_EP_SO" | grep -E 'nccl|nvshmem|cuda|not found'
+
+  预期包含：
+
+  libnccl.so.2
+  libnvshmem_host.so.3
+  libcudart.so
+
+  不能出现 not found。
+
+  ## 11. 两张 GPU 做最终验证
+
+  确认 GPU 拓扑：
+
+  nvidia-smi topo -m
+
+  选择同一 PCIe/NUMA 域内的两张 GPU，然后运行：
+
+  CUDA_VISIBLE_DEVICES=0,1 \
+  EP_DISABLE_GIN=1 \
+  NCCL_LSA_TEAM_SIZE=2 \
+  python3.12 tests/elastic/test_ep.py \
+    --num-processes 2 \
+    --hidden 4096 \
+    --num-topk 6 \
+    --num-experts 256 \
+    --num-tokens 128 \
+    --num-sms 8 \
+    --allow-hybrid-mode 0
+
+  程序完成 dispatch/combine 校验并以退出码 0 结束，才算安装成功。
+
+
+
+
+  ## 1. 启动多进程和 NCCL 通信组
+
+  程序最后通过：
+
+  torch.multiprocessing.spawn(...)
+
+  启动 --num-processes 个子进程，通常一个进程对应一张 GPU，见 tests/elastic/test_ep.py:607。
+
+  例如：
+
+  --num-processes 2
+
+  会启动两个进程：
+
+  rank 0 → cuda:0
+  rank 1 → cuda:1
+
+  每个进程调用 torch.distributed.init_process_group(backend="nccl")，设置当前 CUDA device、随机种子和 BF16 默认类型，见 deep_ep/utils/envs.py:73。
+
+  你运行时设置：
+
+  EP_DISABLE_GIN=1
+  NCCL_LSA_TEAM_SIZE=2
+
+  表示：
+
+  - 禁用 RDMA/Gin scale-out 通信
+  - 两张 GPU 组成同一个 NCCL LSA scale-up 域
+  - 数据通过本机 PCIe peer access 通信
+
+  ## 2. 创建 ElasticBuffer
+
+  每个 rank 创建一个 deep_ep.ElasticBuffer，见 tests/elastic/test_ep.py:521。
+
+  主要参数包括：
+
+  - 每个 rank 最大 token 数
+  - hidden dimension
+  - 是否使用确定性算法
+  - 是否允许 hybrid 模式
+  - 是否允许多阶段 reduction
+  - GPU/CPU timeout
+  - QP 数量
+  - 是否倾向与计算重叠
+
+  你给出的参数：
+
+  --num-tokens 128
+  --hidden 4096
+  --num-topk 6
+  --num-experts 256
+  --num-sms 8
+
+  实际含义是：
+
+  - rank 0 使用 128 个 token
+  - rank 1 使用 127 个 token
+
+  代码故意让不同 rank 的 token 数量略有不同：
+
+  num_tokens = max(1, args.num_tokens - dist.get_rank())
+
+  这是为了覆盖不等长通信。
+
+  其他含义：
+
+  - 每个 token 有 4096 个 hidden 元素
+  - 每个 token 路由到 6 个专家
+  - 全局共 256 个专家
+  - EP=2 时每个 rank 管理 128 个专家
+  - 通信 kernel 使用 8 个 SM
+
+  ## 3. 构造 MoE 路由
+
+  测试先生成一个形状为：
+
+  [num_tokens, num_experts]
+
+  的随机专家分数，然后取 Top-K：
+
+  topk_weights, topk_idx = torch.topk(scores, num_topk)
+
+  得到：
+
+  topk_idx:     [num_tokens, 6]
+  topk_weights: [num_tokens, 6]
+
+  每个 token 根据 topk_idx 被发送到对应专家所在的 GPU。
+
+  还可以测试非均衡路由：
+
+  --unbalanced-ratio 4
+
+  表示某个 rank 接收的路由流量大约是其他 rank 的 4 倍。
+
+  也可以随机屏蔽部分路由：
+
+  --masked-ratio 0.1
+
+  被屏蔽的位置会变成：
+
+  topk_idx = -1
+  topk_weight = 0
+
+  用来测试无效路由处理。
+
+  ## 4. 生成参考 dispatch 结果
+
+  如果没有指定：
+
+  --skip-check
+
+  测试会先调用参考实现 ref_dispatch()，见 deep_ep/utils/refs.py:10。
+
+  参考实现使用标准的：
+
+  torch.distributed.all_to_all_single
+
+  交换：
+
+  - token 数据
+  - FP8 scale factor
+  - top-k expert index
+  - top-k weight
+  - token 来源编号
+
+  这个实现比较慢，但逻辑简单，可以作为 DeepEP CUDA kernel 的“标准答案”。
+
+  之后 DeepEP 的输出会与它逐比特比较。
+
+  ## 5. 测试四种 dispatch
+
+  每个测试组合里会执行四类 dispatch。
+
+  ### 普通 dispatch
+
+  把 token 发送到对应专家所在的 rank：
+
+  输入：
+  x
+  topk_idx
+  topk_weights
+
+  输出：
+  recv_x
+  recv_topk_idx
+  recv_topk_weights
+  handle
+  event
+
+  handle 保存 combine 阶段需要的反向路由信息。
+
+  ### Expanded dispatch
+
+  设置：
+
+  do_expand=True
+
+  普通 dispatch 一般让一个 token 在目标 rank 上保留一份，再通过 top-k metadata 表示对应的本地专家。
+
+  Expanded 模式会将 token 展开到各个专家对应的独立位置，更适合直接形成按专家排列的输入 buffer。
+
+  它还会记录：
+
+  handle.recv_src_metadata
+
+  用于描述：
+
+  - token 来自哪个全局 token
+  - token 展开后放在哪些 expert slot
+
+  ### Cached dispatch
+
+  第一次 dispatch 生成路由 handle 后，第二次直接复用：
+
+  buffer.dispatch(x=x, handle=handle)
+
+  这模拟 MoE 中路由布局不变、下一次只更新 token 数据的情况，避免重新计算元数据。
+
+  测试会确认 cached dispatch 和普通 dispatch 输出完全相同。
+
+  ### Cached expanded dispatch
+
+  同时测试：
+
+  - handle 缓存复用
+  - expanded layout
+  - expert padding 清零
+
+  设置：
+
+  do_zero_padding=True
+
+  测试会逐个专家检查 padding 区域是否全部为零。
+
+  ## 6. BF16 和 FP8 dispatch
+
+  完整测试同时覆盖：
+
+  BF16 token
+  FP8 token + per-token scale factor
+
+  FP8 模式会把 BF16 输入转换成：
+
+  (FP8 数据, scale factor)
+
+  dispatch 后再恢复成 BF16用于部分验证，同时也分别比较原始 FP8 payload 和 scale factor 是否完全一致。
+
+  所以这里测试的不只是数值近似，而是通信过程中 FP8 数据和量化参数有没有损坏。
+
+  ## 7. 模拟专家计算
+
+  这个测试不执行真正的专家 FFN/GEMM。
+
+  dispatch 完成后，它根据：
+
+  - source rank
+  - source token index
+  - top-k 位置
+  - hidden index
+
+  生成确定性的 BF16 数据，见 deep_ep/utils/refs.py:126。
+
+  可以把它理解为：
+
+  recv token
+    → 假装经过专家网络
+    → 产生一个可精确复现的专家输出
+
+  这样不需要真的运行模型，也能精确判断 combine 有没有：
+
+  - 把数据送回正确的源 rank
+  - 放回正确的 token
+  - 按正确顺序求和
+  - 重复或遗漏某个 top-k 专家结果
+
+  ## 8. 测试两种 combine
+
+  ### 普通 combine
+
+  输入普通 dispatch 的 handle 和模拟专家输出：
+
+  buffer.combine(
+      x=input_for_combine,
+      topk_weights=recv_topk_weights,
+      bias=bias,
+      handle=handle,
+  )
+
+  它负责：
+
+  - 将专家结果发送回 token 原始 rank
+  - 恢复原始 token 顺序
+  - 对同一个 token 的多个专家结果进行 reduction
+  - 返回原始 top-k weights
+
+  ### Reduced/expanded combine
+
+  输入 expanded dispatch 生成的布局：
+
+  buffer.combine(
+      x=input_for_expand_combine,
+      handle=expanded_handle,
+  )
+
+  它测试专家展开布局下的 reduction，包括：
+
+  - rank 内 reduction
+  - scale-up 域内 reduction
+  - hybrid reduction 相关路径
+  - multiple reduction 配置
+
+  你命令中的：
+
+  --allow-hybrid-mode 0
+
+  明确关闭 hybrid combine，因此主要测试纯 scale-up/PCIe 路径。
+
+  ## 9. Bias 测试
+
+  完整模式覆盖三种 bias：
+
+  num_bias=0 → 没有 bias
+  num_bias=1 → 一个 bias tensor
+  num_bias=2 → 两个 bias tensor
+
+  两个 bias 时，参考结果会先把两个 bias 转成 FP32相加，再参与 reduction。
+
+  这主要验证 combine epilogue 的 bias 读取和累加逻辑。
+
+  ## 10. 默认完整测试包含 144 种组合
+
+  组合定义在 tests/elastic/test_ep.py:22。
+
+  覆盖以下维度：
+
+  - do_handle_copy
+      - 复制 top-k handle
+      - 直接引用原 top-k tensor
+
+  - expert_alignment
+      - 每个专家 token 数对齐到 128
+      - 不进行额外对齐
+
+  - use_fp8_dispatch
+      - FP8
+      - BF16
+
+  - num_bias
+      - 0、1、2 个 bias
+
+  - with_previous_event
+      - 有前置 CUDA event
+      - 无前置 CUDA event
+
+  - async_with_compute_stream
+      - 与当前计算 stream 异步
+      - 普通同步模式
+
+  - allocate_on_comm_stream
+      - 在通信 stream 上分配
+      - 在当前 stream 上分配
+
+  总计：
+
+  144 种测试组合
+
+  你最后的命令没有指定：
+
+  --test-first-only
+
+  所以它会运行全部 144 种组合。
+
+  如果增加：
+
+  --test-first-only
+
+  只会测试第一种组合：
+
+  handle copy = 开启
+  expert alignment = 128
+  FP8 dispatch = 开启
+  bias = 无
+  previous event = 无
+  async compute stream = 关闭
+  allocate on comm stream = 关闭
+
+  ## 11. 正确性具体检查内容
+
+  正确性检查集中在 tests/elastic/test_ep.py:360。
+
+  主要包括：
+
+  - handle 是否按配置复制或复用原始 tensor
+  - cached handle 是否与原 handle 使用相同路由数据
+  - dispatch 接收 token 总数是否正确
+  - 每个专家收到的 token 数是否正确
+  - expert alignment/padding 是否正确
+  - 每个 scale-up rank 的 token prefix-sum 是否正确
+  - expanded metadata 是否正确
+  - expanded token 的多份副本是否完全相同
+  - padding 区域是否全部清零
+  - cached dispatch 是否与首次 dispatch 完全一致
+  - source token global ID 是否正确
+  - FP8 数据和 scale factor 是否正确
+  - top-k index 是否正确
+  - top-k weights 是否正确
+  - combine 后的 token 是否返回正确 rank 和位置
+  - combine reduction 顺序是否正确
+  - combine 后 top-k weights 是否正确
+
+  最终核心比较使用：
+
+  torch.equal(...)
+
+  不是 allclose()。
+
+  这意味着要求逐元素、逐比特完全一致，不允许浮点误差范围。
+
+  ## 12. 确定性测试
+
+  如果增加：
+
+  --deterministic
+
+  每个 dispatch 会再执行一次，然后检查：
+
+  - 接收 token 顺序
+  - token 数据
+  - top-k index
+  - top-k weights
+  - source metadata
+  - expanded layout
+
+  两次是否完全相同。
+
+  默认命令没有开启这个测试。
+
+  ## 13. 性能测试
+
+  如果没有指定：
+
+  --skip-perf-test
+
+  每个组合都会测量五项性能：
+
+  * dispatch
+  - expanded dispatch
+  # cached dispatch
+  @ combine
+  + reduced combine
+
+  测试使用 PyTorch Kineto profiler，默认每项执行多次并提取指定 CUDA kernel 的平均时间，见 deep_ep/utils/testing.py:111。
+
+  输出示例：
+
+  dispatch: 0 GB/s (SO), 56 GB/s (SU), 35.2 us
+
+  含义：
+
+  - SO：scale-out 带宽，通常指跨节点/RDMA 路径
+  - SU：scale-up 带宽，本机 GPU 间 PCIe/NVLink路径
+  - us：CUDA 通信 kernel 时间
+  - copy：dispatch copy epilogue 的带宽和时间
+  - reduce：combine reduction epilogue 的带宽和时间
+
+  在你的纯 PCIe 配置中：
+
+  SO = 0 GB/s
+  SU > 0 GB/s
+
+  是正常的。SO=0 不表示没有通信，而是没有使用 scale-out/RDMA；实际数据走 SU/PCIe。
+
+  需要注意，这里主要测的是命名 CUDA kernel 的时间，不是包含 Python、CPU 调度和整个模型计算的端到端延迟。
+
+  ## 14. 压力测试
+
+  如果增加：
+
+  --do-pressure-test
+
+  程序会不断更换随机种子并重复全部测试，直到失败或手动停止。
+
+  默认每轮重新创建 ElasticBuffer；加上：
+
+  --reuse-elastic-buffer
+
+  后会重复使用同一个 buffer，适合测试长期复用稳定性。
+
+  压力测试不允许使用：
+
+  --skip-check
+
+  ## 15. 这个测试没有覆盖什么
+
+  它不测试：
+
+  - 真正的专家 MLP/GEMM
+  - 模型训练和反向传播
+  - autograd，因为整个测试运行在 torch.inference_mode()
+  - 模型精度或收敛
+  - 多机 RDMA，当前命令已经禁用 GIN
+  - 长时间稳定性，除非启用 pressure test
+  - 其他 token、hidden、top-k 形状，除非修改参数重复执行
+
+  ## 推荐分三步运行
+
+  先做快速安装冒烟测试：
+
+  EP_DISABLE_GIN=1 NCCL_LSA_TEAM_SIZE=2 \
+  python3.12 tests/elastic/test_ep.py \
+    --num-processes 2 \
+    --hidden 4096 --num-topk 6 --num-experts 256 \
+    --num-tokens 128 --num-sms 8 \
+    --allow-hybrid-mode 0 \
+    --test-first-only --skip-perf-test
+
+  然后跑全部 144 种正确性组合，但暂时跳过性能：
+
+  EP_DISABLE_GIN=1 NCCL_LSA_TEAM_SIZE=2 \
+  python3.12 tests/elastic/test_ep.py \
+    --num-processes 2 \
+    --hidden 4096 --num-topk 6 --num-experts 256 \
+    --num-tokens 128 --num-sms 8 \
+    --allow-hybrid-mode 0 \
+    --skip-perf-test
+
+  最后再跑性能。否则原始命令会对全部 144 种组合分别进行多轮 profiling，运行时间可能很长。

@@ -23,14 +23,14 @@ find_pkgs_spec.loader.exec_module(find_pkgs)
 # without the unversioned `libnvshmem_host.so` symlink. So `-l:libnvshmem_host.so`
 # (exact-name link) cannot resolve. Resolve the real file name at build time
 # and pass it through to the linker instead.
-def _find_versioned_so(base_dir, prefix):
-    """Return the real filename of the first ``{prefix}.so*`` under ``base_dir/lib``.
+def _find_versioned_so(lib_dir, prefix):
+    """Return the real filename of the first ``{prefix}.so*`` under ``lib_dir``.
 
     Prefers an unversioned ``{prefix}.so`` symlink when present so we keep
     behaving identically to the Tarball install. Falls back to the SONAME
     file (``{prefix}.so.X``) shipped by pip wheels.
     """
-    lib_dir = Path(base_dir).joinpath('lib')
+    lib_dir = Path(lib_dir)
     unversioned = lib_dir / f'{prefix}.so'
     if unversioned.exists():
         return unversioned.name
@@ -39,12 +39,12 @@ def _find_versioned_so(base_dir, prefix):
     raise ModuleNotFoundError(f'{prefix}.so not found under {lib_dir}')
 
 
-def get_nvshmem_host_lib_name(base_dir):
-    return _find_versioned_so(base_dir, 'libnvshmem_host')
+def get_nvshmem_host_lib_name(lib_dir):
+    return _find_versioned_so(lib_dir, 'libnvshmem_host')
 
 
-def get_nccl_lib_name(base_dir):
-    return _find_versioned_so(base_dir, 'libnccl')
+def get_nccl_lib_name(lib_dir):
+    return _find_versioned_so(lib_dir, 'libnccl')
 
 
 def get_package_version():
@@ -91,8 +91,10 @@ class CustomBuildPy(build_py):
 
 if __name__ == '__main__':
     # TODO: make NVSHMEM and legacy optional
-    nvshmem_root_dir = find_pkgs.find_nvshmem_root()
-    nccl_root_dir = find_pkgs.find_nccl_root()
+    nvshmem_include_dir = find_pkgs.find_nvshmem_include_dir()
+    nvshmem_lib_dir = find_pkgs.find_nvshmem_lib_dir()
+    nccl_include_dir = find_pkgs.find_nccl_include_dir()
+    nccl_lib_dir = find_pkgs.find_nccl_lib_dir()
 
     # `128,2417` is used to suppress warnings of `fmt`
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
@@ -110,19 +112,19 @@ if __name__ == '__main__':
     # that ``-l:NAME`` can resolve. The static device library always ships
     # under its canonical name, so it stays hard-coded.
     sources.extend(['csrc/kernels/legacy/internode.cu', 'csrc/kernels/legacy/internode_ll.cu', 'csrc/kernels/backend/nvshmem.cu'])
-    include_dirs.extend([f'{nvshmem_root_dir}/include'])
-    library_dirs.extend([f'{nvshmem_root_dir}/lib'])
-    nvcc_dlink.extend(['-dlink', f'-L{nvshmem_root_dir}/lib', '-lnvshmem_device'])
-    nvshmem_host_lib = get_nvshmem_host_lib_name(nvshmem_root_dir)
-    extra_link_args.extend([f'-l:{nvshmem_host_lib}', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_root_dir}/lib'])
+    include_dirs.append(nvshmem_include_dir)
+    library_dirs.append(nvshmem_lib_dir)
+    nvcc_dlink.extend(['-dlink', f'-L{nvshmem_lib_dir}', '-lnvshmem_device'])
+    nvshmem_host_lib = get_nvshmem_host_lib_name(nvshmem_lib_dir)
+    extra_link_args.extend([f'-l:{nvshmem_host_lib}', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_lib_dir}'])
 
     # NCCL flags. Same story as NVSHMEM above — pip wheels ship
     # ``libnccl.so.2`` only, so resolve the real name dynamically.
     sources.extend(['csrc/kernels/backend/nccl.cu'])
-    include_dirs.extend([f'{nccl_root_dir}/include'])
-    nccl_lib = get_nccl_lib_name(nccl_root_dir)
-    library_dirs.extend([f'{nccl_root_dir}/lib'])
-    extra_link_args.extend([f'-l:{nccl_lib}', f'-Wl,-rpath,{nccl_root_dir}/lib'])
+    include_dirs.append(nccl_include_dir)
+    nccl_lib = get_nccl_lib_name(nccl_lib_dir)
+    library_dirs.append(nccl_lib_dir)
+    extra_link_args.extend([f'-l:{nccl_lib}', f'-Wl,-rpath,{nccl_lib_dir}'])
 
     # CUDA driver sources
     sources.extend(['csrc/kernels/backend/cuda_driver.cu'])
@@ -182,8 +184,10 @@ if __name__ == '__main__':
     print(f' > Compilation flags: {extra_compile_args}')
     print(f' > Link flags: {extra_link_args}')
     print(f' > Arch list: {os.environ["TORCH_CUDA_ARCH_LIST"]}')
-    print(f' > NVSHMEM path: {nvshmem_root_dir}')
-    print(f' > NCCL path: {nccl_root_dir}')
+    print(f' > NVSHMEM include path: {nvshmem_include_dir}')
+    print(f' > NVSHMEM library path: {nvshmem_lib_dir}')
+    print(f' > NCCL include path: {nccl_include_dir}')
+    print(f' > NCCL library path: {nccl_lib_dir}')
     # Print persistent env variables
     persistent_envs = []
     for name in persistent_env_names:

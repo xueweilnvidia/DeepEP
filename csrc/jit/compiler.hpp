@@ -24,17 +24,17 @@ public:
     static std::filesystem::path library_root_path;
     static std::filesystem::path library_include_path;
     static std::filesystem::path cuda_home;
-    static std::filesystem::path nccl_root;
+    static std::filesystem::path nccl_include;
     static std::filesystem::path cuobjdump_path;
 
     static void prepare_init(const std::string& library_root_path,
                              const std::string& cuda_home_path_by_python,
-                             const std::string& nccl_root_path_by_python) {
+                             const std::string& nccl_include_path_by_python) {
         // NOTES: if you are adding some third-party includes for kernels, please add its hash value
         Compiler::library_root_path = library_root_path;
         Compiler::library_include_path = Compiler::library_root_path / "include";
         Compiler::cuda_home = cuda_home_path_by_python;
-        Compiler::nccl_root = nccl_root_path_by_python;
+        Compiler::nccl_include = nccl_include_path_by_python;
         Compiler::cuobjdump_path = Compiler::cuda_home / "bin" / "cuobjdump";
     }
 
@@ -45,7 +45,7 @@ public:
         EP_HOST_ASSERT(not library_root_path.empty());
         EP_HOST_ASSERT(not library_include_path.empty());
         EP_HOST_ASSERT(not cuda_home.empty());
-        EP_HOST_ASSERT(not nccl_root.empty());
+        EP_HOST_ASSERT(not nccl_include.empty());
         EP_HOST_ASSERT(not cuobjdump_path.empty());
 
         // Cache settings
@@ -64,7 +64,7 @@ public:
             flags += " -Xcompiler -rdynamic -lineinfo";
         if (get_env("EP_GIN_GDAKI_DEBUG", 0))
             flags += " -DNCCL_DEVICE_GIN_GDAKI_ENABLE_DEBUG=1";
-        flags += fmt::format(" -I {}/include", nccl_root.c_str());
+        flags += fmt::format(" -I {}", nccl_include.c_str());
 
         // Some special flags for EP
         // TODO: make it more general, e.g. `EP_JIT_EXTRA_FLAGS`
@@ -177,7 +177,7 @@ public:
 EP_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_root_path);
 EP_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_include_path);
 EP_DECLARE_STATIC_VAR_IN_CLASS(Compiler, cuda_home);
-EP_DECLARE_STATIC_VAR_IN_CLASS(Compiler, nccl_root);
+EP_DECLARE_STATIC_VAR_IN_CLASS(Compiler, nccl_include);
 EP_DECLARE_STATIC_VAR_IN_CLASS(Compiler, cuobjdump_path);
 
 class NVCCCompiler final: public Compiler {

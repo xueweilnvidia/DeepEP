@@ -1,6 +1,8 @@
 import functools
+import glob
 import os
 import sys
+import sysconfig
 from importlib.metadata import distributions
 from typing import Optional
 
@@ -80,3 +82,98 @@ def find_nvshmem_root(optional: bool = False):
         root: the NVSHMEM root directory.
     """
     return find_pkg_root('nvshmem', optional=optional)
+
+
+def _find_existing_dir(candidates, required_file):
+    for directory in candidates:
+        if directory and os.path.isfile(os.path.join(directory, required_file)):
+            return os.path.realpath(directory)
+    return None
+
+
+def _include_candidates(root, system_candidates):
+    candidates = []
+    if root is not None:
+        candidates.extend((os.path.join(root, 'include'), root))
+    candidates.extend(system_candidates)
+    return candidates
+
+
+def _lib_candidates(root, system_candidates):
+    candidates = []
+    if root is not None:
+        candidates.extend((os.path.join(root, 'lib'), os.path.join(root, 'lib64')))
+        multiarch = sysconfig.get_config_var('MULTIARCH')
+        if multiarch:
+            candidates.append(os.path.join(root, 'lib', multiarch))
+    candidates.extend(system_candidates)
+    return candidates
+
+
+@functools.lru_cache()
+def find_nccl_include_dir(optional: bool = False):
+    root = find_nccl_root(optional=True)
+    include_dir = _find_existing_dir(
+        _include_candidates(root, ('/usr/include', '/usr/local/include')),
+        'nccl.h',
+    )
+    if not optional:
+        assert include_dir is not None, 'Cannot find NCCL headers (nccl.h)'
+    return include_dir
+
+
+@functools.lru_cache()
+def find_nccl_lib_dir(optional: bool = False):
+    root = find_nccl_root(optional=True)
+    multiarch = sysconfig.get_config_var('MULTIARCH')
+    system_candidates = [
+        '/usr/local/lib',
+        '/usr/local/lib64',
+        '/usr/lib',
+        '/usr/lib64',
+    ]
+    if multiarch:
+        system_candidates.insert(0, os.path.join('/usr/lib', multiarch))
+        system_candidates.insert(1, os.path.join('/usr/local/lib', multiarch))
+    lib_dir = _find_existing_dir(_lib_candidates(root, system_candidates), 'libnccl.so')
+    if not optional:
+        assert lib_dir is not None, 'Cannot find NCCL library (libnccl.so)'
+    return lib_dir
+
+
+@functools.lru_cache()
+def find_nvshmem_include_dir(optional: bool = False):
+    root = find_nvshmem_root(optional=True)
+    system_candidates = [
+        '/usr/local/cuda/include',
+        '/usr/include',
+        *sorted(glob.glob('/usr/include/nvshmem_*'), reverse=True),
+    ]
+    include_dir = _find_existing_dir(_include_candidates(root, system_candidates), 'nvshmem.h')
+    if not optional:
+        assert include_dir is not None, 'Cannot find NVSHMEM headers (nvshmem.h)'
+    return include_dir
+
+
+@functools.lru_cache()
+def find_nvshmem_lib_dir(optional: bool = False):
+    root = find_nvshmem_root(optional=True)
+    multiarch = sysconfig.get_config_var('MULTIARCH')
+    system_candidates = [
+        '/usr/local/cuda/lib64',
+        '/usr/local/cuda/lib',
+        '/usr/local/lib',
+        '/usr/local/lib64',
+        '/usr/lib',
+        '/usr/lib64',
+    ]
+    if multiarch:
+        system_candidates = [
+            *sorted(glob.glob(os.path.join('/usr/lib', multiarch, 'nvshmem', '*')), reverse=True),
+            os.path.join('/usr/lib', multiarch),
+            *system_candidates,
+        ]
+    lib_dir = _find_existing_dir(_lib_candidates(root, system_candidates), 'libnvshmem_device.a')
+    if not optional:
+        assert lib_dir is not None, 'Cannot find NVSHMEM device library (libnvshmem_device.a)'
+    return lib_dir

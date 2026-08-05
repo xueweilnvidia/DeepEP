@@ -5,7 +5,7 @@ import subprocess
 import torch
 import os
 
-from .utils.find_pkgs import find_nccl_root
+from .utils.find_pkgs import find_nccl_include_dir, find_nccl_lib_dir
 
 # Set some default environment provided at setup
 try:
@@ -57,8 +57,9 @@ def check_nccl_so():
         for so in [line.strip().split(' ')[-1] for line in f if 'libnccl' in line]:
             loaded_nccl_so = so if loaded_nccl_so is None else loaded_nccl_so
             assert so == loaded_nccl_so, f'Duplicate NCCL runtime found in the current system: {so} and {loaded_nccl_so}'
-    linked_nccl_so_candidates = sorted(glob.glob(f'{find_nccl_root()}/lib/libnccl.so*'))
-    assert linked_nccl_so_candidates, f'No libnccl.so found in {find_nccl_root()}/lib/'
+    nccl_lib_dir = find_nccl_lib_dir()
+    linked_nccl_so_candidates = sorted(glob.glob(f'{nccl_lib_dir}/libnccl.so*'))
+    assert linked_nccl_so_candidates, f'No libnccl.so found in {nccl_lib_dir}/'
     linked_nccl_so = linked_nccl_so_candidates[0]
 
     # So checking binary-level equalness is necessary
@@ -77,7 +78,7 @@ def init_jit():
     library_root_path = os.path.dirname(os.path.abspath(__file__))
     _C.init_jit(library_root_path,  # Library root directory path
                 find_cuda_home(),   # CUDA home
-                find_nccl_root())   # NCCL root
+                find_nccl_include_dir())  # NCCL include directory
 
 # Run initialization
 check_nccl_so()
