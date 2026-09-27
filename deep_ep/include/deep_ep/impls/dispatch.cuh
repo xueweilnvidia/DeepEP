@@ -9,6 +9,7 @@
 #include <deep_ep/common/handle.cuh>
 #include <deep_ep/common/layout.cuh>
 #include <deep_ep/common/math.cuh>
+#include <deep_ep/common/pcie_shm.cuh>
 #include <deep_ep/common/ptx.cuh>
 
 
@@ -24,9 +25,11 @@ template <bool kIsScaleupNVLink,
           int kNumMaxTokensPerRank,
           int kNumExperts, int kNumTopk, int kExpertAlignment,
           int kNumQPs, int64_t kNumTimeoutCycles,
+          bool kStagedSend,
+          bool kPcieShm, int kNumPullWarps,
           int kNumNotifyThreads = kNumNotifyWarps * 32,
           int kNumDispatchThreads = kNumDispatchWarps * 32,
-          int kNumThreads = kNumNotifyThreads + kNumDispatchThreads,
+          int kNumThreads = kNumNotifyThreads + kNumDispatchThreads + kNumPullWarps * 32,
           typename team_t = std::conditional_t<kIsScaleupNVLink, ncclTeamTagLsa, ncclTeamTagWorld>>
 __global__ void __launch_bounds__(kNumThreads, 1)
 dispatch_impl(
@@ -41,7 +44,9 @@ dispatch_impl(
     const int sf_token_stride, const int sf_hidden_stride,
     const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window, void* buffer,
     void* workspace, void* mapped_host_workspace,
-    const int rank_idx
+    const int rank_idx,
+    void* staging,
+    const pcie_shm::Args shm
 ) {
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
     EP_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
@@ -51,9 +56,25 @@ dispatch_impl(
     const auto sm_idx = static_cast<int>(blockIdx.x), thread_idx = static_cast<int>(threadIdx.x);
     const auto warp_idx = ptx::get_warp_idx(), lane_idx = ptx::get_lane_idx();
 
+    // Staged-send mode (PCIe copy engines): tokens for remote ranks are written into a local staging buffer laid out
+    // exactly like the receivers' buffers (`[dst rank][slot]`), the host then copies each `[dst rank]` block with
+    // copy engines and signals arrival (SM-issued cross-socket PCIe peer writes collapse, copy engines do not)
+    EP_STATIC_ASSERT(not kStagedSend or (kIsScaleupNVLink and kDoCPUSync and not kReuseSlotIndices),
+                     "Invalid staged-send configuration");
+
+    // Host-memory mode (see `pcie_shm::Args`): tokens for far ranks go through the receivers' host segments,
+    // and the extra pull warps copy the tokens arrived from far ranks into the local buffer
+    EP_STATIC_ASSERT(not kPcieShm or (kIsScaleupNVLink and not kReuseSlotIndices and not kStagedSend and
+                                      kNumRanks <= 32 and kNumPullWarps > 0),
+                     "Invalid host-memory configuration");
+    EP_STATIC_ASSERT(kPcieShm or kNumPullWarps == 0, "Pull warps are only for the host-memory mode");
+
     // Workspaces
     const auto workspace_layout = layout::WorkspaceLayout(workspace, 1, kNumRanks, kNumExperts);
     const auto host_workspace_layout = layout::WorkspaceLayout(mapped_host_workspace, 1, kNumRanks, kNumExperts);
+
+    // NOTES: the epoch is read before the first barrier, and only updated by SM 0 after the last one
+    const int shm_epoch = kPcieShm ? ptx::ld_volatile<int>(workspace_layout.get_pcie_shm_epoch_ptr()) + 1 : 0;
 
     // The kernel uses a fixed space of dynamic shared memory (no static shared memory)
     extern __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[];
@@ -147,6 +168,13 @@ dispatch_impl(
             }
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
+            // Export the (encoded) number of tokens sent to each rank for the host-issued copies
+            if constexpr (kStagedSend) {
+                for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads)
+                    host_workspace_layout.get_pcie_send_count_ptr(i)[0] = rank_count[i];
+                __threadfence_system();
+            }
+
             // TODO: for further optimization, we can fuse rank and expert counters
             // Issue scaleup rank count writes to peers
             for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
@@ -201,6 +229,14 @@ dispatch_impl(
             }
 
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+
+            // Publish the number of tokens received from each rank for the pull warps
+            if constexpr (kPcieShm) {
+                for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
+                    ptx::st_release_sys(workspace_layout.get_pcie_shm_recv_count_ptr(i),
+                                        (static_cast<int64_t>(shm_epoch) << 32) | static_cast<uint32_t>(rank_count[i]));
+                }
+            }
 
             // Reduce expert count and add stats
             for (int i = thread_idx; i < kNumExpertsPerRank; i += kNumNotifyThreads) {
@@ -257,7 +293,7 @@ dispatch_impl(
                 do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
             }
         }
-    } else {
+    } else if (warp_idx < kNumNotifyWarps + kNumDispatchWarps) {
         const int dispatch_warp_idx = warp_idx - kNumNotifyWarps;
 
         // Buffer layouts
@@ -265,6 +301,7 @@ dispatch_impl(
         const auto tma_buffer = layout::BufferLayout<true>(token_layout, kNumDispatchWarps, 1,
             math::advance_ptr<int>(smem, kNumSmemBytesForNotify)).get_rank_buffer(dispatch_warp_idx).get_token_buffer(0);
         auto recv_buffer = layout::BufferLayout<false>(token_layout, kNumRanks, kNumMaxTokensPerRank, buffer);
+        const auto staging_buffer = layout::BufferLayout<false>(token_layout, kNumRanks, kNumMaxTokensPerRank, staging);
         auto send_buffer = layout::BufferLayout<false>(token_layout, 1, kNumMaxTokensPerRank, recv_buffer.get_buffer_end_ptr());
         recv_buffer = recv_buffer.get_rank_buffer(rank_idx);
 
@@ -276,14 +313,22 @@ dispatch_impl(
         __syncwarp();
 
         // Iterate all tokens
+        // NOTES: in the host-memory mode, each lane publishes the flags of its host-memory stores in batches
+        pcie_shm::PendingFlags shm_pending_flags;
         const auto token_start = dispatch_warp_idx * kNumSMs + sm_idx;
         const auto token_stride = kNumDispatchWarps * kNumSMs;
         for (int token_idx = token_start; token_idx < num_tokens; token_idx += token_stride) {
             const auto token_i64_idx = static_cast<int64_t>(token_idx);
 
-            // Wait TMA store arrivals
-            ptx::tma_store_wait();
-            __syncwarp();
+            // Wait TMA store arrivals (host-memory mode: only the shared memory reads, flags are published in batches)
+            if constexpr (kPcieShm) {
+                ptx::tma_store_wait_read();
+                __syncwarp();
+                shm_pending_flags.publish(shm_epoch, true);
+            } else {
+                ptx::tma_store_wait();
+                __syncwarp();
+            }
 
             // Issue data TMA
             if (ptx::elect_one_sync()) {
@@ -371,9 +416,19 @@ dispatch_impl(
 
             // Issue TMA NVLink stores
             EP_STATIC_ASSERT(kNumTopk <= 32, "Invalid top-k selection");
-            const auto dst_ptr = stored_dst_slot_idx >= 0 ?
+            auto dst_ptr = stored_dst_slot_idx >= 0 ?
                 gin.get_sym_ptr<team_t>(recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(), stored_dst_rank_idx) :
                 nullptr;
+            if (kStagedSend and stored_dst_slot_idx >= 0)
+                dst_ptr = staging_buffer.get_rank_buffer(stored_dst_rank_idx).get_token_buffer(stored_dst_slot_idx).get_base_ptr();
+            if constexpr (kPcieShm) {
+                if (stored_dst_slot_idx >= 0 and pcie_shm::is_far(shm, stored_dst_rank_idx)) {
+                    dst_ptr = pcie_shm::get_host_ptr(shm, stored_dst_rank_idx, buffer,
+                                                     recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr());
+                    shm_pending_flags.add(pcie_shm::get_flag_ptr(shm, stored_dst_rank_idx, rank_idx, stored_dst_slot_idx,
+                                                                 kNumMaxTokensPerRank));
+                }
+            }
             if (dst_ptr != nullptr)
                 ptx::tma_store_1d(dst_ptr, tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
             ptx::tma_store_commit();
@@ -394,15 +449,58 @@ dispatch_impl(
             }
         }
 
+        // Publish the remaining flags
+        if constexpr (kPcieShm)
+            shm_pending_flags.publish(shm_epoch);
+    } else if constexpr (kPcieShm) {
+        // Pull warps: copy the tokens arrived from far ranks (`[src rank][slot]`) from the local host segment
+        const int global_pull_warp_idx = (warp_idx - kNumNotifyWarps - kNumDispatchWarps) * kNumSMs + sm_idx;
+        constexpr int kNumGlobalPullWarps = kNumPullWarps * kNumSMs;
+        const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true);
+        const auto local_buffer = layout::BufferLayout<false>(token_layout, kNumRanks, kNumMaxTokensPerRank, buffer);
+        const int num_token_bytes = token_layout.get_num_bytes<false>();
+
+        // Lane `i` gets the number of tokens received from far rank `i`
+        int count = 0;
+        if (lane_idx < kNumRanks and pcie_shm::is_far(shm, lane_idx)) {
+            const auto count_ptr = workspace_layout.get_pcie_shm_recv_count_ptr(lane_idx);
+            const auto start_clock = clock64();
+            int64_t value;
+            while (((value = ptx::ld_acquire_sys(count_ptr)) >> 32) != shm_epoch) {
+                if (clock64() - start_clock > kNumTimeoutCycles) {
+                    printf("DeepEP PCIe host-memory count timeout, rank: %d, src: %d\n", rank_idx, lane_idx);
+                    asm volatile("trap;");
+                }
+            }
+            count = static_cast<int>(value & 0xffffffffll);
+        }
+        __syncwarp();
+        pcie_shm::pull<kNumGlobalPullWarps, kNumTimeoutCycles>(
+            shm, count, buffer, local_buffer.get_num_bytes_per_rank(), num_token_bytes, kNumMaxTokensPerRank,
+            rank_idx, shm_epoch, global_pull_warp_idx, lane_idx);
     }
 
     // Barrier to ensure data arrival
-    comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag1, true, true, false>(
-        gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
+    if constexpr (kStagedSend) {
+        // Data arrival is signaled by the host-issued copies, only drain local stores here
+        ptx::tma_store_commit();
+        ptx::tma_store_wait();
+        __syncwarp();
+        cooperative_groups::this_grid().sync();
+    } else {
+        comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
+                          kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag1, true, true, false>(
+            gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
+    }
 
     // Trigger the copy epilogue kernel
     cudaTriggerProgrammaticLaunchCompletion();
+
+    // Finish the host-memory epoch
+    if constexpr (kPcieShm) {
+        if (sm_idx == 0 and thread_idx == 0)
+            *workspace_layout.get_pcie_shm_epoch_ptr() = shm_epoch;
+    }
 
     // Clean atomic counters
     EP_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");

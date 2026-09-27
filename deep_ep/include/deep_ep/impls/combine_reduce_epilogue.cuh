@@ -16,6 +16,7 @@ template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kHidden,
           int kNumMaxTokensPerRank,
           int kNumExperts, int kNumTopk,
+          bool kStagedRecv,
           int kNumThreads = kNumWarps * 32,
           int kNumHiddenBytes = kHidden * sizeof(nv_bfloat16),
           int kNumRanks = kNumScaleoutRanks == 1 ? kNumScaleupRanks : kNumScaleoutRanks,
@@ -28,7 +29,8 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
                              void* recv_buffer,
                              void* bias_0, void* bias_1,
                              const int num_combined_tokens,
-                             const int scaleout_rank_idx, const int scaleup_rank_idx) {
+                             const int scaleout_rank_idx, const int scaleup_rank_idx,
+                             const int* dst_buffer_slot_idx) {
     constexpr int kNumExpertsPerScaleout = kNumExperts / kNumScaleoutRanks;
     constexpr int kNumExpertsPerRank = kNumExperts / (kNumScaleupRanks * kNumScaleoutRanks);
     EP_STATIC_ASSERT(kNumExperts % (kNumScaleupRanks * kNumScaleoutRanks) == 0, "Invalid number of experts or ranks");
@@ -43,6 +45,14 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
     const auto comm_token_layout = layout::TokenLayout(kNumHiddenBytes, 0, kNumTopk, false);
     const auto comm_buffer = layout::BufferLayout<false>(
         comm_token_layout, kNumTokensInLayout, kNumMaxTokensPerRank, recv_buffer);
+
+    // Staged mode (PCIe copy engines): rank `r` wrote the token at `[r][dispatch slot]` of this rank's landing buffer
+    EP_STATIC_ASSERT(not kStagedRecv or (kNumScaleoutRanks == 1 and not kUseRankLayout and
+                                         not (kUseExpandedLayout and not kAllowMultipleReduction)),
+                     "Invalid staged configuration");
+    const auto staged_buffer = layout::BufferLayout<false>(
+        comm_token_layout, 1, kNumRanks * kNumMaxTokensPerRank, recv_buffer);
+    const auto rank_idx = scaleout_rank_idx * kNumScaleupRanks + scaleup_rank_idx;
 
     // Store buffers
     const auto output_token_layout = layout::TokenLayout(kNumHiddenBytes, 0, 0, false);
@@ -69,6 +79,17 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
                 stored_dst_expert_idx / (kNumScaleoutRanks == 1 ? kNumExpertsPerRank : kNumExpertsPerScaleout) : -1;
         }
         __syncwarp();
+
+        // Staged mode: the landing row of each (master) top-k selection
+        int stored_landing_row = -1;
+        if constexpr (kStagedRecv) {
+            if (lane_idx < kNumTopk and stored_dst_rank_idx >= 0) {
+                const auto encoded_slot_idx = dst_buffer_slot_idx[token_idx * kNumTopk + lane_idx];
+                if (encoded_slot_idx >= 0)
+                    stored_landing_row = stored_dst_rank_idx * kNumMaxTokensPerRank + (encoded_slot_idx - rank_idx * kNumMaxTokensPerRank);
+            }
+            __syncwarp();
+        }
 
         // Sort valid top-k indices to front
         const auto [should_deduplicate, deduplicate_key] = [&]() -> std::pair<bool, int> {
@@ -101,6 +122,10 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
         combine_reduce<kHiddenVec, kUnrollFactor, kNumTokensInLayout>(
             lane_idx, topk_slot_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
             /* Get source base */ [=](const int& slot_idx) {
+                if constexpr (kStagedRecv) {
+                    const auto row = ptx::exchange(stored_landing_row, max(slot_idx, 0));
+                    return static_cast<combine_vec_t*>(staged_buffer.get_token_buffer(max(row, 0)).get_base_ptr());
+                }
                 return static_cast<combine_vec_t*>(
                     comm_buffer.get_rank_buffer(slot_idx).get_token_buffer(token_idx).get_base_ptr());
             },
@@ -127,12 +152,15 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
         // Write top-k weights
         if (combined_topk_weights != nullptr) {
             const auto master_lane_idx = ptx::get_master_lane_idx(ptx::match(stored_dst_rank_idx));
+            const auto master_landing_row = kStagedRecv ? ptx::exchange(stored_landing_row, master_lane_idx) : -1;
             if (lane_idx < kNumTopk) {
                 float value = 0;
                 if (stored_dst_rank_idx >= 0) {
-                    const auto dst_ptr = comm_buffer
-                        .get_rank_buffer(kUseRankLayout ? stored_dst_rank_idx : master_lane_idx)
-                        .get_token_buffer(token_idx).get_topk_weights_ptr() + lane_idx;
+                    const auto dst_ptr = kStagedRecv ?
+                        staged_buffer.get_token_buffer(master_landing_row).get_topk_weights_ptr() + lane_idx :
+                        comm_buffer
+                            .get_rank_buffer(kUseRankLayout ? stored_dst_rank_idx : master_lane_idx)
+                            .get_token_buffer(token_idx).get_topk_weights_ptr() + lane_idx;
                     value = *dst_ptr;
                 }
                 combined_topk_weights[token_idx * kNumTopk + lane_idx] = value;

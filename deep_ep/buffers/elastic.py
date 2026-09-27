@@ -1,5 +1,7 @@
 import functools
 import os
+import shutil
+import tempfile
 import math
 import torch
 import torch.distributed as dist
@@ -370,6 +372,24 @@ class ElasticBuffer:
 
         # Physical rank indices
         self.num_rdma_ranks, self.num_nvlink_ranks = self.get_physical_domain_size()
+
+        # PCIe copy-engine send: exchange legacy IPC handles of the landing buffers
+        # NOTES: legacy IPC works only within a node, and the copy-engine path supports only the single-scaleout mode
+        if int(os.environ.get('EP_PCIE_CE', 0)) and self.num_rdma_ranks == 1 and self.num_scaleout_ranks == 1:
+            handles = [None] * self.num_ranks
+            dist.all_gather_object(handles, self.runtime.get_pcie_landing_handle(), self.group)
+            self.runtime.set_pcie_landing_handles(handles)
+
+        # PCIe host-memory send: exchange the host segments' FDs over Unix sockets in a private directory (single node only)
+        if int(os.environ.get('EP_PCIE_SHM', 0)) and self.num_rdma_ranks == 1 and self.num_scaleout_ranks == 1:
+            socket_dirs = [None] * self.num_ranks
+            dist.all_gather_object(socket_dirs, tempfile.mkdtemp(prefix='deep_ep_pcie_shm_') if self.rank_idx == 0 else None, self.group)
+            handles = [None] * self.num_ranks
+            dist.all_gather_object(handles, self.runtime.get_pcie_shm_handle(socket_dirs[0]), self.group)
+            self.runtime.set_pcie_shm_handles(handles, socket_dirs[0])
+            dist.barrier(group=self.group)
+            if self.rank_idx == 0:
+                shutil.rmtree(socket_dirs[0], ignore_errors=True)
 
         # Call a barrier to ensure initialization visibility for all peers
         torch.cuda.synchronize()
@@ -1116,5 +1136,6 @@ class ElasticBuffer:
                                  previous_event_before_epilogue,
                                  async_with_compute_stream,
                                  allocate_on_comm_stream,
-                                 handle.do_expand)
+                                 handle.do_expand,
+                                 handle.dst_buffer_slot_idx)
         return combined_x, combined_topk_weights, EventOverlap(event)

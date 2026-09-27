@@ -77,6 +77,14 @@ struct WorkspaceLayout {
         // AGRS signals
         num_bytes += (kNumMaxInflightAGRS + 1) * kNumMaxRanks * sizeof(int);
 
+        // PCIe copy-engine send: per-source-rank arrival signals + per-destination send counts (host workspace)
+        num_bytes += kNumMaxRanks * sizeof(int) + kNumMaxRanks * sizeof(int64_t);
+
+        // PCIe host-memory send: epoch-tagged per-source-rank receive counts + the epoch counter
+        // + epoch-tagged combine receive counts + the combine count arrival counter
+        num_bytes += kNumMaxRanks * sizeof(int64_t) + sizeof(int64_t);
+        num_bytes += kNumMaxRanks * sizeof(int64_t) + sizeof(int64_t);
+
         return num_bytes;
     }
 
@@ -175,6 +183,36 @@ struct WorkspaceLayout {
         const auto base_ptr = math::advance_ptr<int>(
             get_agrs_recv_signal_ptr(0, 0), kNumMaxInflightAGRS * kNumMaxRanks * sizeof(int));
         return base_ptr + rank_idx;
+    }
+
+    // PCIe copy-engine send: written (value = epoch) by source rank `rank_idx` after its copies into this rank landed
+    __forceinline__ __device__ __host__ int* get_pcie_ce_signal_ptr(const int& rank_idx) const {
+        return get_agrs_session_signal_ptr(0) + kNumMaxRanks + rank_idx;
+    }
+
+    // PCIe copy-engine send: encoded number of tokens sent to each destination rank (read by the host)
+    __forceinline__ __device__ __host__ int64_t* get_pcie_send_count_ptr(const int& rank_idx) const {
+        return math::advance_ptr<int64_t>(get_pcie_ce_signal_ptr(0), kNumMaxRanks * sizeof(int)) + rank_idx;
+    }
+
+    // PCIe host-memory send: `(epoch << 32) | count` of tokens received from each source rank (published by SM 0)
+    __forceinline__ __device__ __host__ int64_t* get_pcie_shm_recv_count_ptr(const int& rank_idx) const {
+        return get_pcie_send_count_ptr(0) + kNumMaxRanks + rank_idx;
+    }
+
+    // PCIe host-memory send: the epoch of the last finished host-memory kernel (dispatch or combine)
+    __forceinline__ __device__ __host__ int* get_pcie_shm_epoch_ptr() const {
+        return reinterpret_cast<int*>(get_pcie_shm_recv_count_ptr(0) + kNumMaxRanks);
+    }
+
+    // PCIe host-memory send: `(epoch << 32) | count` of tokens to be returned by each rank at combine (reduced by the
+    // pull warps with `atomicMax`), and the number of pull warps which have contributed (reset at the kernel end)
+    __forceinline__ __device__ __host__ uint64_t* get_pcie_shm_combine_count_ptr(const int& rank_idx) const {
+        return reinterpret_cast<uint64_t*>(get_pcie_shm_recv_count_ptr(0) + kNumMaxRanks + 1) + rank_idx;
+    }
+
+    __forceinline__ __device__ __host__ int* get_pcie_shm_combine_arrival_ptr() const {
+        return reinterpret_cast<int*>(get_pcie_shm_combine_count_ptr(0) + kNumMaxRanks);
     }
 };
 

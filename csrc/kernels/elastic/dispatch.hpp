@@ -5,6 +5,7 @@
 
 #include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/exception.cuh>
+#include <deep_ep/common/pcie_shm.cuh>
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/launch_runtime.hpp"
@@ -27,6 +28,9 @@ public:
         int num_experts, num_topk, expert_alignment;
         int num_qps;
         int64_t num_timeout_cycles;
+        bool staged_send;
+        bool pcie_shm;
+        int num_pull_warps;
 
         // Parameters
         void* x; sf_pack_t* sf; topk_idx_t* topk_idx; float* topk_weights;
@@ -44,6 +48,8 @@ public:
         void* buffer;
         void* workspace; void* mapped_host_workspace;
         int scaleout_rank_idx, scaleup_rank_idx;
+        void* staging;
+        pcie_shm::Args shm;
 
         jit::LaunchArgs launch_args;
     };
@@ -52,7 +58,7 @@ public:
         std::string header_name, func_name;
         if (args.num_scaleout_ranks == 1) {
             header_name = "dispatch";
-            func_name = fmt::format("dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.is_scaleup_nvlink,
                 args.do_cpu_sync,
                 args.reuse_slot_indices,
@@ -62,7 +68,9 @@ public:
                 args.num_hidden_bytes, args.num_sf_packs,
                 args.num_max_tokens_per_rank,
                 args.num_experts, args.num_topk, args.expert_alignment,
-                args.num_qps, args.num_timeout_cycles);
+                args.num_qps, args.num_timeout_cycles,
+                args.staged_send,
+                args.pcie_shm, args.num_pull_warps);
         } else {
             header_name = "hybrid_dispatch";
             func_name = fmt::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
@@ -104,7 +112,9 @@ static void __instantiate_kernel() {{
                 args.nccl_dev_comm, args.nccl_window,
                 args.buffer,
                 args.workspace, args.mapped_host_workspace,
-                args.scaleup_rank_idx));
+                args.scaleup_rank_idx,
+                args.staging,
+                args.shm));
         } else {
             EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
                 kernel, config,
@@ -162,7 +172,9 @@ static void launch_dispatch(void* x, void* sf,
                             const int& num_qps, const int64_t& num_timeout_cycles,
                             const bool& cached_mode,
                             const bool& do_cpu_sync,
-                            const at::cuda::CUDAStream& stream) {
+                            const at::cuda::CUDAStream& stream,
+                            void* staging = nullptr,
+                            const pcie_shm::Args& shm = pcie_shm::Args{}) {
     // Cached mode does not support expert token counting
     if (cached_mode)
         EP_HOST_ASSERT(cumulative_local_expert_recv_stats == nullptr);
@@ -177,6 +189,11 @@ static void launch_dispatch(void* x, void* sf,
     const int num_notify_smem_bytes = cached_mode ? 0 : get_num_notify_smem_bytes(num_ranks, num_experts);
     EP_HOST_ASSERT(num_notify_warps % 4 == 0);
 
+    // Host-memory mode pull warps
+    const bool pcie_shm = shm.segments != nullptr;
+    const int num_pull_warps = pcie_shm ? get_env<int>("EP_PCIE_SHM_PULL_WARPS", 4) : 0;
+    EP_HOST_ASSERT(not pcie_shm or (num_scaleout_ranks == 1 and num_pull_warps > 0));
+
     // Other warps
     int num_dispatch_warps = 0;
     int num_scaleout_warps = 0, num_forward_warps = 0;
@@ -186,8 +203,8 @@ static void launch_dispatch(void* x, void* sf,
     if (num_scaleout_ranks == 1) {
         const auto token_layout = get_dispatch_token_layout(hidden, elem_size, num_sf_packs, num_topk);
         num_dispatch_warps = std::min<int>(
-            (num_smem_bytes - num_notify_smem_bytes) / token_layout.get_num_bytes<true>(), 32 - num_notify_warps);
-        num_threads = (num_notify_warps + num_dispatch_warps) * 32;
+            (num_smem_bytes - num_notify_smem_bytes) / token_layout.get_num_bytes<true>(), 32 - num_notify_warps - num_pull_warps);
+        num_threads = (num_notify_warps + num_dispatch_warps + num_pull_warps) * 32;
     } else {
         // Hybrid kernels
         num_scaleout_warps = num_channels_per_sm;
@@ -208,6 +225,8 @@ static void launch_dispatch(void* x, void* sf,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .num_experts = num_experts, .num_topk = num_topk, .expert_alignment = expert_alignment,
         .num_qps = num_qps, .num_timeout_cycles = num_timeout_cycles,
+        .staged_send = staging != nullptr,
+        .pcie_shm = pcie_shm, .num_pull_warps = num_pull_warps,
         .x = x, .sf = static_cast<sf_pack_t*>(sf), .topk_idx = topk_idx, .topk_weights = topk_weights,
         .copied_topk_idx = copied_topk_idx,
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats,
@@ -222,6 +241,8 @@ static void launch_dispatch(void* x, void* sf,
         .buffer = buffer,
         .workspace = workspace, .mapped_host_workspace = mapped_host_workspace,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
+        .staging = staging,
+        .shm = shm,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)};
     const auto code = DispatchRuntime::generate(args);

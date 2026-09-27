@@ -4,6 +4,7 @@
 
 #include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/exception.cuh>
+#include <deep_ep/common/pcie_shm.cuh>
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/launch_runtime.hpp"
@@ -24,6 +25,9 @@ public:
         int num_topk;
         int num_qps;
         int64_t num_timeout_cycles;
+        bool staged_send;
+        bool pcie_shm;
+        int num_pull_warps;
 
         // Parameters
         nv_bfloat16* x;
@@ -38,6 +42,11 @@ public:
         void* workspace;
         int scaleout_rank_idx, scaleup_rank_idx;
         int num_reduced_tokens;
+        void* staging;
+        pcie_shm::Args shm;
+        const topk_idx_t* combined_topk_idx;
+        const int* dst_buffer_slot_idx;
+        int num_combined_tokens;
 
         jit::LaunchArgs launch_args;
     };
@@ -46,17 +55,19 @@ public:
         std::string header_name, func_name;
         if (args.num_scaleout_ranks == 1) {
             header_name = "combine";
-            func_name = fmt::format("combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                                     args.is_scaleup_nvlink,
                                     args.use_expanded_layout, args.allow_multiple_reduction,
                                     args.launch_args.grid_dim.first,
-                                    args.launch_args.num_threads / 32,
+                                    args.launch_args.num_threads / 32 - args.num_pull_warps,
                                     args.num_scaleup_ranks * args.num_scaleout_ranks,
                                     args.hidden,
                                     args.num_max_tokens_per_rank,
                                     args.num_experts,
                                     args.num_topk,
-                                    args.num_qps, args.num_timeout_cycles);
+                                    args.num_qps, args.num_timeout_cycles,
+                                    args.staged_send,
+                                    args.pcie_shm, args.num_pull_warps);
         } else {
             header_name = "hybrid_combine";
             func_name = fmt::format("hybrid_combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
@@ -90,7 +101,12 @@ static void __instantiate_kernel() {{
                                                      args.nccl_dev_comm, args.nccl_window,
                                                      args.buffer, args.workspace,
                                                      args.scaleup_rank_idx,
-                                                     args.num_reduced_tokens));
+                                                     args.num_reduced_tokens,
+                                                     args.staging,
+                                                     args.shm,
+                                                     args.combined_topk_idx,
+                                                     args.dst_buffer_slot_idx,
+                                                     args.num_combined_tokens));
         } else {
             EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(kernel, config,
                                                      args.x, args.topk_weights,
@@ -129,10 +145,21 @@ static void* launch_combine(void* x,
                             const int& num_sms, const int& num_smem_bytes,
                             const int& num_channels,
                             const bool& use_expanded_layout, const bool& allow_multiple_reduction,
-                            const at::cuda::CUDAStream& stream) {
+                            const at::cuda::CUDAStream& stream,
+                            void* staging = nullptr,
+                            const pcie_shm::Args& shm = pcie_shm::Args{},
+                            const topk_idx_t* combined_topk_idx = nullptr,
+                            const int* dst_buffer_slot_idx = nullptr,
+                            const int& num_combined_tokens = 0) {
+    // Host-memory mode pull warps
+    const bool pcie_shm = shm.segments != nullptr;
+    const int num_pull_warps = pcie_shm ? get_env<int>("EP_PCIE_SHM_PULL_WARPS", 4) : 0;
+    EP_HOST_ASSERT(not pcie_shm or (num_scaleout_ranks == 1 and num_pull_warps > 0 and
+                                    combined_topk_idx != nullptr and dst_buffer_slot_idx != nullptr));
+
     // Maximize shared memory utilization
     const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
-    auto num_warps = std::min(num_smem_bytes / token_layout.get_num_bytes<true>(), 32);
+    auto num_warps = std::min(num_smem_bytes / token_layout.get_num_bytes<true>(), 32 - num_pull_warps);
 
     // Decide warps
     int num_scaleup_warps = 0, num_forward_warps = 0;
@@ -148,7 +175,7 @@ static void* launch_combine(void* x,
     }
 
     // Generate, build and launch
-    const auto num_threads = num_warps * 32;
+    const auto num_threads = (num_warps + num_pull_warps) * 32;
     const CombineRuntime::Args args = {
         .is_scaleup_nvlink = is_scaleup_nvlink,
         .use_expanded_layout = use_expanded_layout,
@@ -160,6 +187,8 @@ static void* launch_combine(void* x,
         .num_experts = num_experts,
         .num_topk = num_topk,
         .num_qps = num_qps, .num_timeout_cycles = num_timeout_cycles,
+        .staged_send = staging != nullptr,
+        .pcie_shm = pcie_shm, .num_pull_warps = num_pull_warps,
         .x = static_cast<nv_bfloat16*>(x),
         .topk_weights = static_cast<float*>(topk_weights),
         .src_metadata = src_metadata,
@@ -170,6 +199,11 @@ static void* launch_combine(void* x,
         .buffer = buffer, .workspace = workspace,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
         .num_reduced_tokens = num_reduced_tokens,
+        .staging = staging,
+        .shm = shm,
+        .combined_topk_idx = combined_topk_idx,
+        .dst_buffer_slot_idx = dst_buffer_slot_idx,
+        .num_combined_tokens = num_combined_tokens,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)
     };
@@ -201,6 +235,7 @@ public:
         int hidden;
         int num_max_tokens_per_rank;
         int num_experts, num_topk;
+        bool staged_recv;
 
         // Parameters
         nv_bfloat16* combined_x;
@@ -211,6 +246,7 @@ public:
         void* bias_1;
         int num_combined_tokens;
         int scaleout_rank_idx, scaleup_rank_idx;
+        int* dst_buffer_slot_idx;
 
         jit::LaunchArgs launch_args;
     };
@@ -222,7 +258,7 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",                        args.use_expanded_layout, args.allow_multiple_reduction,
                            args.launch_args.grid_dim.first,
@@ -230,7 +266,8 @@ static void __instantiate_kernel() {{
                            args.num_scaleout_ranks, args.num_scaleup_ranks,
                            args.hidden,
                            args.num_max_tokens_per_rank,
-                           args.num_experts, args.num_topk);
+                           args.num_experts, args.num_topk,
+                           args.staged_recv);
     }
 
     static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
@@ -241,7 +278,8 @@ static void __instantiate_kernel() {{
                                                  args.reduce_buffer,
                                                  args.bias_0, args.bias_1,
                                                  args.num_combined_tokens,
-                                                 args.scaleout_rank_idx, args.scaleup_rank_idx));
+                                                 args.scaleout_rank_idx, args.scaleup_rank_idx,
+                                                 args.dst_buffer_slot_idx));
     }
 };
 
@@ -257,7 +295,8 @@ static void launch_combine_reduce_epilogue(void* combined_x,
                                            const int& scaleout_rank_idx, const int& scaleup_rank_idx,
                                            const int& num_sms, const int& num_smem_bytes,
                                            const bool& use_expanded_layout, const bool& allow_multiple_reduction,
-                                           const at::cuda::CUDAStream& stream) {
+                                           const at::cuda::CUDAStream& stream,
+                                           int* dst_buffer_slot_idx = nullptr) {
     // Maximize shared memory utilization
     // Too many warps may cause performance degrade, so we limit into 1024
     const auto token_layout = layout::TokenLayout(hidden * sizeof(nv_bfloat16), 0, 0, false);
@@ -272,6 +311,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
         .hidden = hidden,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .num_experts = num_experts, .num_topk = num_topk,
+        .staged_recv = dst_buffer_slot_idx != nullptr,
         .combined_x = static_cast<nv_bfloat16*>(combined_x),
         .combined_topk_weights = combined_topk_weights,
         .combined_topk_idx = combined_topk_idx,
@@ -279,6 +319,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
         .bias_0 = bias_0, .bias_1 = bias_1,
         .num_combined_tokens = num_combined_tokens,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
+        .dst_buffer_slot_idx = dst_buffer_slot_idx,
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 1, false, true)
     };
     const auto code = CombineReduceEpilogueRuntime::generate(args);

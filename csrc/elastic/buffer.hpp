@@ -2,11 +2,22 @@
 
 #include <cuda_runtime.h>
 #include <memory>
+#include <unordered_map>
+#include <algorithm>
+#include <climits>
+#include <cstdlib>
+#include <cstring>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <thread>
+#include <unordered_set>
 #include <numeric>
 #include <vector>
 #include <pybind11/functional.h>
 
 #include <deep_ep/common/layout.cuh>
+#include <deep_ep/common/pcie_shm.cuh>
 #include <deep_ep/common/compiled.cuh>
 
 #include "../kernels/backend/api.cuh"
@@ -52,6 +63,230 @@ class ElasticBuffer {
 
     // NCCL context
     std::shared_ptr<nccl::NCCLSymmetricMemoryContext> nccl_context;
+
+    // PCIe copy-engine send (`EP_PCIE_CE=1`): local staging buffer (`[dst rank][slot]`) and arrival epochs
+    mutable torch::Tensor pcie_staging;
+    mutable std::vector<at::cuda::CUDAStream> pcie_ce_streams;
+
+    // PCIe copy-engine send: a plain `cudaMalloc` landing buffer (dispatch/combine receive layout), shared via legacy
+    // CUDA IPC, so that it can be mapped into peer devices' contexts (see `set_pcie_landing_handles`)
+    void* pcie_landing = nullptr;
+    std::vector<void*> pcie_peer_landing;
+    // The device whose context each peer mapping was opened in (`-1` for the local device)
+    std::vector<int> pcie_peer_device;
+
+    // PCIe copy-engine send: per-source-rank received token counts of staged dispatches, keyed by the handle's
+    // `psum_num_recv_tokens_per_scaleup_rank` storage, reused as per-destination send counts by the staged combine
+    // NOTES: the entry holds a reference to the psum tensor, so that its storage (the key) cannot be freed and reused
+    // by another (e.g. non-staged) dispatch while the entry is alive
+    mutable std::unordered_map<const void*, std::pair<torch::Tensor, std::vector<int>>> pcie_recv_counts;
+
+    // Grow the staging buffer, allocated on the communication stream: all its users (the kernels, and the copy-engine
+    // streams, which are joined back) are ordered on it, so the released old buffer can not be reused concurrently
+    void ensure_pcie_staging(const int64_t& num_bytes) const {
+        if (pcie_staging.defined() and pcie_staging.numel() >= num_bytes)
+            return;
+        const auto previous_stream = at::cuda::getCurrentCUDAStream();
+        at::cuda::setCurrentCUDAStream(comm_stream);
+        pcie_staging = torch::Tensor();
+        pcie_staging = torch::empty({num_bytes}, torch::TensorOptions(torch::kCUDA).dtype(torch::kByte));
+        at::cuda::setCurrentCUDAStream(previous_stream);
+    }
+
+    // Copy `counts[i]` tokens of the local staging block `i` into rank `i`'s landing block of this rank with copy engines
+    // (one stream per destination), then signal arrival to all peers and wait for all of them
+    void pcie_ce_send(const void* staging, const int64_t& num_bytes_per_rank, const int64_t& num_bytes_per_token,
+                      const std::vector<int>& counts) const {
+        std::vector<void*> dst_ptrs, src_ptrs, write_ptrs, wait_ptrs;
+        std::vector<size_t> sizes;
+        for (int i = 0; i < nccl_context->num_ranks; ++ i) {
+            const auto dst_rank_idx = (nccl_context->rank_idx + i) % nccl_context->num_ranks;
+            if (counts[dst_rank_idx] > 0) {
+                src_ptrs.push_back(math::advance_ptr(const_cast<void*>(staging), num_bytes_per_rank * dst_rank_idx));
+                dst_ptrs.push_back(math::advance_ptr(pcie_peer_landing[dst_rank_idx], num_bytes_per_rank * nccl_context->rank_idx));
+                sizes.push_back(static_cast<size_t>(counts[dst_rank_idx]) * num_bytes_per_token);
+            }
+            if (dst_rank_idx != nccl_context->rank_idx) {
+                write_ptrs.push_back(nccl_context->get_sym_ptr(workspace_layout_wo_expert->get_pcie_ce_signal_ptr(nccl_context->rank_idx), dst_rank_idx));
+                wait_ptrs.push_back(workspace_layout_wo_expert->get_pcie_ce_signal_ptr(dst_rank_idx));
+            }
+        }
+
+        // One stream per destination, so that multiple copy engines work concurrently
+        if (not sizes.empty()) {
+            while (pcie_ce_streams.size() < sizes.size())
+                pcie_ce_streams.push_back(at::cuda::getStreamFromPool(false));
+            const auto fork_event = EventHandle(comm_stream);
+            for (int i = 0; i < sizes.size(); ++ i) {
+                stream_wait(pcie_ce_streams[i], fork_event);
+                CUDA_RUNTIME_CHECK(cudaMemcpyAsync(dst_ptrs[i], src_ptrs[i], sizes[i], cudaMemcpyDefault, pcie_ce_streams[i]));
+            }
+            for (int i = 0; i < sizes.size(); ++ i)
+                stream_wait(comm_stream, pcie_ce_streams[i]);
+        }
+        pcie_ce_epoch += 1;
+        cuda_driver::batched_write_and_wait(comm_stream, write_ptrs, wait_ptrs, static_cast<int>(pcie_ce_epoch));
+    }
+    // NOTES: unsigned wrap-around is fine, stream waits compare `(int32_t)(value - target) >= 0`
+    mutable uint32_t pcie_ce_epoch = 0;
+
+    // PCIe host-memory send (`EP_PCIE_SHM=1`, see `pcie_shm::Args`): all ranks' host segments mapped contiguously
+    int64_t pcie_shm_segment_bytes = 0;
+    CUdeviceptr pcie_shm_base = 0;
+    std::vector<CUmemGenericAllocationHandle> pcie_shm_handles;
+    int pcie_shm_export_fd = -1;
+    int pcie_shm_listen_fd = -1;
+    uint32_t pcie_shm_far_mask = 0;
+    torch::Tensor pcie_shm_segment_ptrs;
+
+    pcie_shm::Args get_pcie_shm_args() const {
+        return {reinterpret_cast<void* const*>(pcie_shm_segment_ptrs.data_ptr()), num_buffer_bytes, pcie_shm_far_mask};
+    }
+
+    // The CPU root port above this GPU (`/sys/devices/pciDDDD:BB/<root port>`, empty if the GPU is not behind a
+    // switch/bridge): GPUs under the same root port share its uplink, and P2P between them stays inside the switch
+    static std::pair<std::string, std::string> get_pcie_topology() {
+        int device_idx;
+        char bus_id[32] = {};
+        CUDA_RUNTIME_CHECK(cudaGetDevice(&device_idx));
+        CUDA_RUNTIME_CHECK(cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), device_idx));
+        std::string lower_bus_id(bus_id);
+        std::transform(lower_bus_id.begin(), lower_bus_id.end(), lower_bus_id.begin(), ::tolower);
+        std::string switch_key;
+        char resolved[PATH_MAX];
+        if (realpath(("/sys/bus/pci/devices/" + lower_bus_id).c_str(), resolved) != nullptr) {
+            const std::string path = resolved, prefix = "/sys/devices/";
+            if (path.rfind(prefix, 0) == 0) {
+                const auto first = path.find('/', prefix.size());
+                const auto second = first == std::string::npos ? std::string::npos : path.find('/', first + 1);
+                // Only GPUs behind a switch/bridge (at least one more level) are grouped
+                if (second != std::string::npos)
+                    switch_key = path.substr(0, second);
+            }
+        }
+        return {std::string(bus_id), switch_key};
+    }
+
+    // Whether rank `i`'s peer-to-peer path from this rank goes through the CPU (`EP_PCIE_CE_DIRECT_GROUP` overrides)
+    bool is_pcie_far_rank(const int& i, const std::string& my_switch_key, const std::string& switch_key) const {
+        if (i == nccl_context->rank_idx)
+            return false;
+        const int direct_group = get_env<int>("EP_PCIE_CE_DIRECT_GROUP", 0);
+        return direct_group > 0 ? (i / direct_group != nccl_context->rank_idx / direct_group) :
+                                  (my_switch_key.empty() or switch_key != my_switch_key);
+    }
+
+    // PCIe host-memory send: the host segments' FDs are exchanged over Unix sockets (`SCM_RIGHTS`) in a private
+    // (`0700`) directory, and both sides check the peer's credentials (same user, one of the ranks' processes)
+    static sockaddr_un get_pcie_shm_socket_addr(const std::string& socket_dir, const int& rank_idx) {
+        sockaddr_un addr = {};
+        addr.sun_family = AF_UNIX;
+        const auto path = socket_dir + "/" + std::to_string(rank_idx) + ".sock";
+        EP_HOST_ASSERT(path.size() < sizeof(addr.sun_path));
+        std::strcpy(addr.sun_path, path.c_str());
+        return addr;
+    }
+
+    static int get_pcie_shm_peer_pid(const int& sock) {
+        ucred cred = {};
+        socklen_t len = sizeof(cred);
+        EP_HOST_ASSERT(getsockopt(sock, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0);
+        return cred.uid == getuid() ? cred.pid : -1;
+    }
+
+    static bool send_pcie_shm_fd(const int& sock, const int& fd) {
+        char byte = 0;
+        iovec iov = {&byte, 1};
+        alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))] = {};
+        msghdr msg = {};
+        msg.msg_iov = &iov, msg.msg_iovlen = 1;
+        msg.msg_control = control, msg.msg_controllen = sizeof(control);
+        const auto cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET, cmsg->cmsg_type = SCM_RIGHTS, cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+        std::memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
+        return sendmsg(sock, &msg, MSG_NOSIGNAL) == 1;
+    }
+
+    static int recv_pcie_shm_fd(const int& sock) {
+        char byte = 0;
+        iovec iov = {&byte, 1};
+        alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))] = {};
+        msghdr msg = {};
+        msg.msg_iov = &iov, msg.msg_iovlen = 1;
+        msg.msg_control = control, msg.msg_controllen = sizeof(control);
+        if (recvmsg(sock, &msg, MSG_CMSG_CLOEXEC) != 1)
+            return -1;
+        const auto cmsg = CMSG_FIRSTHDR(&msg);
+        if (cmsg == nullptr or cmsg->cmsg_level != SOL_SOCKET or cmsg->cmsg_type != SCM_RIGHTS)
+            return -1;
+        int fd;
+        std::memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
+        return fd;
+    }
+
+    // Send this rank's segment FD to every other rank, and receive theirs (`fds[rank_idx]` is this rank's own FD)
+    std::vector<int> exchange_pcie_shm_fds(const std::vector<int>& pids, const std::string& socket_dir) {
+        const auto num_ranks = nccl_context->num_ranks, rank_idx = nccl_context->rank_idx;
+        constexpr int kTimeoutMs = 120000;
+
+        // Serve this rank's FD to the other ranks' processes only
+        std::string server_error;
+        std::thread server([&]() {
+            std::unordered_set<int> pending_pids(pids.begin(), pids.end());
+            pending_pids.erase(pids[rank_idx]);
+            while (not pending_pids.empty()) {
+                pollfd pfd = {pcie_shm_listen_fd, POLLIN, 0};
+                if (poll(&pfd, 1, kTimeoutMs) != 1) {
+                    server_error = "timeout while serving the host segment";
+                    return;
+                }
+                const int sock = accept4(pcie_shm_listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
+                if (sock < 0)
+                    continue;
+                // Reject unknown processes (e.g. other users' or unrelated processes)
+                const auto pid = get_pcie_shm_peer_pid(sock);
+                if (pending_pids.count(pid) > 0 and send_pcie_shm_fd(sock, pcie_shm_export_fd))
+                    pending_pids.erase(pid);
+                close(sock);
+            }
+        });
+
+        // Receive the other ranks' FDs
+        std::vector<int> fds(num_ranks, -1);
+        fds[rank_idx] = pcie_shm_export_fd;
+        std::string client_error;
+        for (int i = 1; i < num_ranks and client_error.empty(); ++ i) {
+            const auto peer = (rank_idx + i) % num_ranks;
+            const int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            EP_HOST_ASSERT(sock >= 0);
+            const auto addr = get_pcie_shm_socket_addr(socket_dir, peer);
+            const timeval timeout = {kTimeoutMs / 1000, 0};
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            if (connect(sock, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0) {
+                client_error = fmt::format("failed to connect to rank {}: {}", peer, std::strerror(errno));
+            } else if (get_pcie_shm_peer_pid(sock) != pids[peer]) {
+                client_error = fmt::format("unexpected process serving rank {}", peer);
+            } else if ((fds[peer] = recv_pcie_shm_fd(sock)) < 0) {
+                client_error = fmt::format("failed to receive the host segment of rank {}", peer);
+            }
+            close(sock);
+        }
+        server.join();
+
+        // Stop serving
+        close(pcie_shm_listen_fd);
+        pcie_shm_listen_fd = -1;
+        const auto addr = get_pcie_shm_socket_addr(socket_dir, rank_idx);
+        unlink(addr.sun_path);
+        if (not server_error.empty() or not client_error.empty()) {
+            for (int i = 0; i < num_ranks; ++ i) {
+                if (i != rank_idx and fds[i] >= 0)
+                    close(fds[i]);
+            }
+            EP_HOST_UNREACHABLE(fmt::format("PCIe host-memory FD exchange failed: {} {}", server_error, client_error));
+        }
+        return fds;
+    }
 
     // Some EP hybrid mode settings
     static constexpr int kNumMaxChannelsPerSM = 8;
@@ -159,6 +394,41 @@ public:
         // Deallocate host workspaces
         CUDA_RUNTIME_CHECK(cudaFreeHost(host_workspace));
 
+        // Release PCIe copy-engine landing buffers
+        // NOTES: mappings opened in a peer device's context must be closed in that context
+        int current_device;
+        CUDA_RUNTIME_CHECK(cudaGetDevice(&current_device));
+        for (int i = 0; i < pcie_peer_landing.size(); ++ i) {
+            if (i == nccl_context->rank_idx or pcie_peer_landing[i] == nullptr)
+                continue;
+            if (pcie_peer_device[i] >= 0)
+                CUDA_RUNTIME_CHECK(cudaSetDevice(pcie_peer_device[i]));
+            const auto result = cudaIpcCloseMemHandle(pcie_peer_landing[i]);
+            CUDA_RUNTIME_CHECK(cudaSetDevice(current_device));
+            CUDA_RUNTIME_CHECK(result);
+        }
+        pcie_peer_landing.clear();
+        pcie_peer_device.clear();
+        pcie_recv_counts.clear();
+        pcie_staging = torch::Tensor();
+        if (pcie_shm_base != 0) {
+            CUDA_DRIVER_CHECK(lazy_cuMemUnmap(pcie_shm_base, pcie_shm_segment_bytes * pcie_shm_handles.size()));
+            for (const auto& handle: pcie_shm_handles)
+                CUDA_DRIVER_CHECK(lazy_cuMemRelease(handle));
+            CUDA_DRIVER_CHECK(lazy_cuMemAddressFree(pcie_shm_base, pcie_shm_segment_bytes * pcie_shm_handles.size()));
+            pcie_shm_handles.clear();
+            pcie_shm_base = 0;
+        }
+        if (pcie_shm_export_fd >= 0)
+            close(pcie_shm_export_fd);
+        if (pcie_shm_listen_fd >= 0)
+            close(pcie_shm_listen_fd);
+        pcie_shm_export_fd = pcie_shm_listen_fd = -1;
+        pcie_shm_segment_ptrs = torch::Tensor();
+        if (pcie_landing != nullptr)
+            CUDA_RUNTIME_CHECK(cudaFree(pcie_landing));
+        pcie_landing = nullptr;
+
         // Destroy NCCL context
         nccl_context->finalize();
 
@@ -168,6 +438,125 @@ public:
 
     torch::Stream get_comm_stream() const {
         return comm_stream;
+    }
+
+    // Returns `(IPC handle, PCI bus ID, PCIe switch key)` of this rank's landing buffer
+    std::tuple<pybind11::bytes, std::string, std::string> get_pcie_landing_handle() {
+        EP_HOST_ASSERT(pcie_landing == nullptr);
+        CUDA_RUNTIME_CHECK(cudaMalloc(&pcie_landing, num_buffer_bytes));
+        cudaIpcMemHandle_t handle;
+        CUDA_RUNTIME_CHECK(cudaIpcGetMemHandle(&handle, pcie_landing));
+
+        const auto [bus_id, switch_key] = get_pcie_topology();
+        return {pybind11::bytes(reinterpret_cast<const char*>(&handle), sizeof(handle)), bus_id, switch_key};
+    }
+
+    void set_pcie_landing_handles(const std::vector<std::tuple<pybind11::bytes, std::string, std::string>>& handles) {
+        EP_HOST_ASSERT(pcie_landing != nullptr and handles.size() == nccl_context->num_ranks);
+        const auto& my_switch_key = std::get<2>(handles[nccl_context->rank_idx]);
+        pcie_peer_landing.assign(nccl_context->num_ranks, nullptr);
+        pcie_peer_device.assign(nccl_context->num_ranks, -1);
+        for (int i = 0; i < nccl_context->num_ranks; ++ i) {
+            if (i == nccl_context->rank_idx) {
+                pcie_peer_landing[i] = pcie_landing;
+                continue;
+            }
+            const auto& [handle_bytes, bus_id, switch_key] = handles[i];
+            const auto bytes = static_cast<std::string>(handle_bytes);
+            EP_HOST_ASSERT(bytes.size() == sizeof(cudaIpcMemHandle_t));
+            cudaIpcMemHandle_t handle;
+            std::memcpy(&handle, bytes.data(), sizeof(handle));
+
+            // Peers behind the same PCIe switch: map into this device's context (direct P2P through the switch)
+            // Other peers: map into the peer device's context, the driver then runs these cross-context copies
+            // as pipelined device-to-host-to-device copies on multiple copy engines, which avoids the collapse of
+            // cross-socket PCIe peer-to-peer writes (NOTES: costs a CUDA context per peer device, ~2 GB on each GPU)
+            const bool is_direct = not is_pcie_far_rank(i, my_switch_key, switch_key);
+            int peer_device = -1;
+            if (not is_direct and cudaDeviceGetByPCIBusId(&peer_device, bus_id.c_str()) != cudaSuccess) {
+                (void) cudaGetLastError();
+                peer_device = -1;
+                printf("[DeepEP] Warning: rank %d: PCIe copy-engine peer %d (%s) is not visible to this process, "
+                       "falling back to direct P2P (cross-socket P2P may be slow, do not restrict `CUDA_VISIBLE_DEVICES`)\n",
+                       nccl_context->rank_idx, i, bus_id.c_str());
+            }
+            if (peer_device >= 0) {
+                // Restore the current device before checking the result
+                int current_device;
+                CUDA_RUNTIME_CHECK(cudaGetDevice(&current_device));
+                CUDA_RUNTIME_CHECK(cudaSetDevice(peer_device));
+                const auto result = cudaIpcOpenMemHandle(&pcie_peer_landing[i], handle, cudaIpcMemLazyEnablePeerAccess);
+                CUDA_RUNTIME_CHECK(cudaSetDevice(current_device));
+                CUDA_RUNTIME_CHECK(result);
+                pcie_peer_device[i] = peer_device;
+            } else {
+                CUDA_RUNTIME_CHECK(cudaIpcOpenMemHandle(&pcie_peer_landing[i], handle, cudaIpcMemLazyEnablePeerAccess));
+            }
+            if (get_env<int>("EP_BUFFER_DEBUG"))
+                printf("[DeepEP] Rank %d: PCIe copy-engine peer %d (%s) mapped %s\n", nccl_context->rank_idx, i, bus_id.c_str(),
+                       peer_device >= 0 ? "in the peer context (host-staged copies)" : "in the local context (direct P2P)");
+        }
+    }
+
+    // Creates this rank's host segment (on this GPU's NUMA node) and starts listening in `socket_dir` for its FD
+    // exchange, returns `(pid, PCIe switch key)`
+    std::tuple<int, std::string> get_pcie_shm_handle(const std::string& socket_dir) {
+        EP_HOST_ASSERT(pcie_shm_export_fd < 0 and pcie_shm_listen_fd < 0 and pcie_shm_base == 0);
+        // Data (the GPU buffer layout) + arrival flags (`[src rank][slot]`, tokens are at least 256 bytes)
+        pcie_shm_segment_bytes = math::align<int64_t>(num_buffer_bytes + num_buffer_bytes / 64, symmetric::kNumAlignmentBytes);
+        pcie_shm_export_fd = symmetric::HybridElasticSymmetricMemory::create_cpu_handle(pcie_shm_segment_bytes).second;
+
+        pcie_shm_listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        EP_HOST_ASSERT(pcie_shm_listen_fd >= 0);
+        const auto addr = get_pcie_shm_socket_addr(socket_dir, nccl_context->rank_idx);
+        unlink(addr.sun_path);
+        EP_HOST_ASSERT(bind(pcie_shm_listen_fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == 0);
+        EP_HOST_ASSERT(listen(pcie_shm_listen_fd, nccl_context->num_ranks) == 0);
+        return {getpid(), get_pcie_topology().second};
+    }
+
+    void set_pcie_shm_handles(const std::vector<std::tuple<int, std::string>>& handles, const std::string& socket_dir) {
+        EP_HOST_ASSERT(pcie_shm_export_fd >= 0 and pcie_shm_listen_fd >= 0 and pcie_shm_base == 0 and
+                       handles.size() == nccl_context->num_ranks);
+        EP_HOST_ASSERT(nccl_context->num_ranks <= 32);
+        const auto num_ranks = nccl_context->num_ranks;
+        const auto& my_switch_key = std::get<1>(handles[nccl_context->rank_idx]);
+        int device_idx;
+        CUDA_RUNTIME_CHECK(cudaGetDevice(&device_idx));
+
+        // Exchange FDs
+        std::vector<int> pids(num_ranks);
+        for (int i = 0; i < num_ranks; ++ i)
+            pids[i] = std::get<0>(handles[i]);
+        const auto fds = exchange_pcie_shm_fds(pids, socket_dir);
+
+        // Import and map all ranks' segments
+        CUDA_DRIVER_CHECK(lazy_cuMemAddressReserve(&pcie_shm_base, pcie_shm_segment_bytes * num_ranks, symmetric::kNumAlignmentBytes, 0, 0));
+        pcie_shm_handles.resize(num_ranks);
+        std::vector<int64_t> segment_ptrs(num_ranks);
+        pcie_shm_far_mask = 0;
+        for (int i = 0; i < num_ranks; ++ i) {
+            const auto& switch_key = std::get<1>(handles[i]);
+            const auto addr = pcie_shm_base + pcie_shm_segment_bytes * i;
+            CUDA_DRIVER_CHECK(lazy_cuMemImportFromShareableHandle(
+                &pcie_shm_handles[i], reinterpret_cast<void*>(static_cast<uintptr_t>(fds[i])),
+                CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
+            CUDA_DRIVER_CHECK(lazy_cuMemMap(addr, pcie_shm_segment_bytes, 0, pcie_shm_handles[i], 0));
+            symmetric::set_access(addr, pcie_shm_segment_bytes, device_idx);
+            if (i != nccl_context->rank_idx)
+                close(fds[i]);
+            segment_ptrs[i] = static_cast<int64_t>(addr);
+            if (is_pcie_far_rank(i, my_switch_key, switch_key))
+                pcie_shm_far_mask |= 1u << i;
+        }
+        pcie_shm_segment_ptrs = torch::tensor(segment_ptrs, torch::TensorOptions(torch::kInt64)).to(torch::kCUDA);
+
+        // Clean this rank's arrival flags (epochs start from 1)
+        CUDA_RUNTIME_CHECK(cudaMemset(reinterpret_cast<void*>(segment_ptrs[nccl_context->rank_idx] + num_buffer_bytes), 0,
+                                      pcie_shm_segment_bytes - num_buffer_bytes));
+        CUDA_RUNTIME_CHECK(cudaDeviceSynchronize());
+        if (get_env<int>("EP_BUFFER_DEBUG"))
+            printf("[DeepEP] Rank %d: PCIe host-memory send, far rank mask 0x%x\n", nccl_context->rank_idx, pcie_shm_far_mask);
     }
 
     std::tuple<int, int> get_physical_domain_size() const {
@@ -989,6 +1378,33 @@ public:
 
         // Do dispatch into the buffers (with SM limitation)
         EP_HOST_ASSERT(num_sms <= jit::device_runtime->get_num_sms());
+
+        // Send via copy engines on PCIe (single hop into peers' buffers), see `dispatch_impl`
+        // NOTES: the per-destination copy sizes are read on the host, so CUDA graph capturing uses the default path
+        // Or via host memory on PCIe (`EP_PCIE_SHM=1`, takes precedence, no CPU sync required), see `pcie_shm::Args`
+        cudaStreamCaptureStatus capture_status;
+        CUDA_RUNTIME_CHECK(cudaStreamIsCapturing(comm_stream, &capture_status));
+        const bool shm_send = get_env<int>("EP_PCIE_SHM", 0) != 0 and pcie_shm_base != 0 and
+                              nccl_context->num_scaleout_ranks == 1 and nccl_context->is_scaleup_nvlink and
+                              not cached_mode;
+        const bool staged_send = get_env<int>("EP_PCIE_CE", 0) != 0 and not pcie_peer_landing.empty() and
+                                 nccl_context->num_scaleout_ranks == 1 and nccl_context->is_scaleup_nvlink and
+                                 not cached_mode and do_cpu_sync and not shm_send and
+                                 capture_status == cudaStreamCaptureStatusNone;
+        const auto dispatch_recv_layout = layout::BufferLayout<false>(
+            get_dispatch_token_layout(hidden, x.element_size(), num_sf_packs, num_topk),
+            nccl_context->num_ranks, num_max_tokens_per_rank, buffer);
+        if (shm_send) {
+            EP_HOST_ASSERT(dispatch_recv_layout.get_num_bytes() <= num_buffer_bytes and
+                           nccl_context->num_ranks * num_max_tokens_per_rank * static_cast<int64_t>(sizeof(int)) <=
+                           pcie_shm_segment_bytes - num_buffer_bytes);
+        }
+        if (staged_send) {
+            ensure_pcie_staging(dispatch_recv_layout.get_num_bytes());
+            std::fill_n(host_workspace_layout.get_pcie_send_count_ptr(0), nccl_context->num_ranks, 0);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+        }
+
         launch_dispatch(x.data_ptr(), sf_ptr,
                         topk_idx.data_ptr<topk_idx_t>(), topk_weights_ptr,
                         copied_topk_idx_ptr,
@@ -1012,7 +1428,9 @@ public:
                         num_smem_bytes,
                         num_qps, num_gpu_timeout_cycles,
                         cached_mode, do_cpu_sync,
-                        comm_stream);
+                        comm_stream,
+                        staged_send ? pcie_staging.data_ptr() : nullptr,
+                        shm_send ? get_pcie_shm_args() : pcie_shm::Args{});
 
         // Received token counters
         int num_recv_tokens = 0, num_expanded_tokens = 0;
@@ -1134,9 +1552,32 @@ public:
         }
         EP_HOST_ASSERT(psum_num_recv_tokens_per_expert.size(0) == num_local_experts);
 
+        // Copy staged tokens into peers' buffers with copy engines, then signal arrival and wait for all sources
+        if (staged_send) {
+            const auto start_cpu_time = std::chrono::high_resolution_clock::now();
+            std::vector<int> send_counts(nccl_context->num_ranks), recv_counts(nccl_context->num_ranks);
+            for (int i = 0; i < nccl_context->num_ranks; ++ i) {
+                while (not math::is_decoded_positive_ready(send_counts[i] = math::encode_decode_positive(
+                           static_cast<int>(host_workspace_layout.get_pcie_send_count_ptr(i)[0])))) {
+                    const auto now = std::chrono::high_resolution_clock::now();
+                    if (std::chrono::duration_cast<std::chrono::seconds>(now - start_cpu_time).count() > num_cpu_timeout_secs)
+                        throw EPExceptionWithLineInfo("Dispatch CPU wait", "PCIe copy-engine send counts");
+                }
+                recv_counts[i] = math::encode_decode_positive(
+                    static_cast<int>(host_workspace_layout.get_scaleup_rank_count_ptr<false>()[i]));
+            }
+            pcie_ce_send(pcie_staging.data_ptr(), dispatch_recv_layout.get_num_bytes_per_rank(),
+                         dispatch_recv_layout.get_num_bytes_per_token(), send_counts);
+
+            // Remember the received counts for the staged combine
+            if (pcie_recv_counts.size() > 1024)
+                pcie_recv_counts.clear();
+            pcie_recv_counts[psum_num_recv_tokens_per_scaleup_rank.data_ptr()] = {psum_num_recv_tokens_per_scaleup_rank, recv_counts};
+        }
+
         // Launch copy kernels with full SMs
         stream_control_before_epilogue(previous_event_before_epilogue);
-        launch_dispatch_copy_epilogue(buffer, workspace,
+        launch_dispatch_copy_epilogue(staged_send ? pcie_landing : buffer, workspace,
                                       psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
                                       psum_num_recv_tokens_per_expert.data_ptr<int>(),
                                       recv_x.data_ptr(), recv_sf_ptr,
@@ -1205,7 +1646,8 @@ public:
             const std::optional<EventHandle>& previous_event_before_epilogue,
             const bool& async_with_compute_stream,
             const bool& allocate_on_comm_stream,
-            const bool& use_expanded_layout) const {
+            const bool& use_expanded_layout,
+            const std::optional<torch::Tensor>& dst_buffer_slot_idx) const {
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0);
 
@@ -1292,9 +1734,33 @@ public:
             EP_HOST_ASSERT(channel_linked_list->scalar_type() == torch::kInt);
         }
 
+        // Send via copy engines on PCIe (see `combine_impl`), requires the counts of a staged dispatch
+        cudaStreamCaptureStatus capture_status;
+        CUDA_RUNTIME_CHECK(cudaStreamIsCapturing(comm_stream, &capture_status));
+        // Or via host memory on PCIe (`EP_PCIE_SHM=1`, takes precedence), the receive layout is the same
+        const auto recv_counts_it = pcie_recv_counts.find(psum_num_recv_tokens_per_scaleup_rank.data_ptr());
+        const bool staged_layout = nccl_context->num_scaleout_ranks == 1 and nccl_context->is_scaleup_nvlink and
+                                   not (use_expanded_layout and not allow_multiple_reduction) and
+                                   not (allow_multiple_reduction and nccl_context->num_ranks <= num_topk) and
+                                   dst_buffer_slot_idx.has_value();
+        const bool shm_send = get_env<int>("EP_PCIE_SHM", 0) != 0 and pcie_shm_base != 0 and staged_layout;
+        const bool staged_send = get_env<int>("EP_PCIE_CE", 0) != 0 and not pcie_peer_landing.empty() and
+                                 staged_layout and not shm_send and recv_counts_it != pcie_recv_counts.end() and
+                                 capture_status == cudaStreamCaptureStatusNone;
+        const auto combine_recv_layout = layout::BufferLayout<false>(
+            get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk),
+            nccl_context->num_ranks, num_max_tokens_per_rank, nullptr);
+        if (staged_send)
+            ensure_pcie_staging(combine_recv_layout.get_num_bytes());
+        if (shm_send) {
+            EP_HOST_ASSERT(combine_recv_layout.get_num_bytes() <= num_gpu_buffer_bytes and
+                           nccl_context->num_ranks * num_max_tokens_per_rank * static_cast<int64_t>(sizeof(int)) <=
+                           pcie_shm_segment_bytes - num_buffer_bytes);
+        }
+
         // Push data into remote buffers
         // NOTES: we don't use `num_hidden_bytes` due to enable later quantization possibility
-        const auto reduce_buffer = launch_combine(
+        auto reduce_buffer = launch_combine(
             x.data_ptr(),
             topk_weights.has_value() ? topk_weights->data_ptr() : nullptr,
             src_metadata.data_ptr<int>(),
@@ -1312,7 +1778,19 @@ public:
             num_sms, jit::device_runtime->get_num_smem_bytes(),
             num_channels,
             use_expanded_layout, allow_multiple_reduction,
-            comm_stream);
+            comm_stream,
+            staged_send ? pcie_staging.data_ptr() : nullptr,
+            shm_send ? get_pcie_shm_args() : pcie_shm::Args{},
+            combined_topk_idx.data_ptr<topk_idx_t>(),
+            dst_buffer_slot_idx.has_value() ? dst_buffer_slot_idx->data_ptr<int>() : nullptr,
+            num_combined_tokens);
+
+        // Copy staged tokens back into the source ranks' landing buffers
+        if (staged_send) {
+            pcie_ce_send(pcie_staging.data_ptr(), combine_recv_layout.get_num_bytes_per_rank(),
+                         combine_recv_layout.get_num_bytes_per_token(), recv_counts_it->second.second);
+            reduce_buffer = pcie_landing;
+        }
 
         // Allocate output tensors
         auto combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
@@ -1338,7 +1816,8 @@ public:
                                        jit::device_runtime->get_num_sms(),
                                        jit::device_runtime->get_num_smem_bytes(),
                                        use_expanded_layout, allow_multiple_reduction,
-                                       comm_stream);
+                                       comm_stream,
+                                       staged_send or shm_send ? dst_buffer_slot_idx->data_ptr<int>() : nullptr);
 
         // Stream control
         const auto event = stream_control_epilogue(
@@ -1363,6 +1842,10 @@ static void register_apis(pybind11::module_& m) {
         .def("get_physical_domain_size", &ElasticBuffer::get_physical_domain_size)
         .def("get_logical_domain_size", &ElasticBuffer::get_logical_domain_size)
         .def("barrier", &ElasticBuffer::barrier)
+        .def("get_pcie_landing_handle", &ElasticBuffer::get_pcie_landing_handle)
+        .def("set_pcie_landing_handles", &ElasticBuffer::set_pcie_landing_handles)
+        .def("get_pcie_shm_handle", &ElasticBuffer::get_pcie_shm_handle)
+        .def("set_pcie_shm_handles", &ElasticBuffer::set_pcie_shm_handles)
         .def("engram_write", &ElasticBuffer::engram_write)
         .def("engram_fetch", &ElasticBuffer::engram_fetch)
         .def("pp_set_config", &ElasticBuffer::pp_set_config)
