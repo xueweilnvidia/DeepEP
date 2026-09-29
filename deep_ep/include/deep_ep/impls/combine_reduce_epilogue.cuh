@@ -47,7 +47,8 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
         comm_token_layout, kNumTokensInLayout, kNumMaxTokensPerRank, recv_buffer);
 
     // Staged mode (PCIe copy engines): rank `r` wrote the token at `[r][dispatch slot]` of this rank's landing buffer
-    EP_STATIC_ASSERT(not kStagedRecv or (kNumScaleoutRanks == 1 and not kUseRankLayout and
+    // NOTES: this replaces the rank layout as well, as tokens are located by the (master) top-k lanes' slots
+    EP_STATIC_ASSERT(not kStagedRecv or (kNumScaleoutRanks == 1 and
                                          not (kUseExpandedLayout and not kAllowMultipleReduction)),
                      "Invalid staged configuration");
     const auto staged_buffer = layout::BufferLayout<false>(
@@ -111,7 +112,7 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
         compute_topk_slots(
             topk_slot_idx, reduce_valid_mask,
             [=](const int& idx) {
-                return kUseRankLayout ? ptx::exchange(stored_dst_rank_idx, idx) : idx;
+                return (kUseRankLayout and not kStagedRecv) ? ptx::exchange(stored_dst_rank_idx, idx) : idx;
             }
         );
 

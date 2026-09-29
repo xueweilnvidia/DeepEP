@@ -59,7 +59,7 @@ combine_impl(nv_bfloat16* x,
     // Host-memory mode (see `pcie_shm::Args`): the same `[src rank][slot]` layout as the staged mode, but written
     // directly into the source ranks' GPU buffers (near ranks) or host segments (far ranks, then pulled by the
     // source ranks' pull warps)
-    EP_STATIC_ASSERT(not kPcieShm or (kIsScaleupNVLink and not kDoExpandedSend and not kUseRankLayout and
+    EP_STATIC_ASSERT(not kPcieShm or (kIsScaleupNVLink and not kDoExpandedSend and
                                       not kStagedSend and kNumRanks <= 32 and kNumPullWarps > 0),
                      "Invalid host-memory configuration");
     EP_STATIC_ASSERT(kPcieShm or kNumPullWarps == 0, "Pull warps are only for the host-memory mode");

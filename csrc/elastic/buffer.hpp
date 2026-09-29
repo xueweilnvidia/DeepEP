@@ -1741,7 +1741,6 @@ public:
         const auto recv_counts_it = pcie_recv_counts.find(psum_num_recv_tokens_per_scaleup_rank.data_ptr());
         const bool staged_layout = nccl_context->num_scaleout_ranks == 1 and nccl_context->is_scaleup_nvlink and
                                    not (use_expanded_layout and not allow_multiple_reduction) and
-                                   not (allow_multiple_reduction and nccl_context->num_ranks <= num_topk) and
                                    dst_buffer_slot_idx.has_value();
         const bool shm_send = get_env<int>("EP_PCIE_SHM", 0) != 0 and pcie_shm_base != 0 and staged_layout;
         const bool staged_send = get_env<int>("EP_PCIE_CE", 0) != 0 and not pcie_peer_landing.empty() and

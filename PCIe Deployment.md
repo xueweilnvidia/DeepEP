@@ -350,10 +350,10 @@ host 内存模式下 dispatch 用 12 个 SM 可达约 23.4 GB/s。
 
 ### 注意事项
 
-- 两种模式都要求单机（`num_scaleout_ranks == 1`）。expand 且不允许多次归约的 combine、rank layout（`num_ranks <= num_topk`）的 combine 会自动退回 SM 直写路径。
+- 两种模式都要求单机（`num_scaleout_ranks == 1`）。expand 且不允许多次归约的 combine 会自动退回 SM 直写路径；rank layout（`allow_multiple_reduction` 且 `num_ranks <= num_topk`）的 combine 同样走 `[src rank][slot]` 暂存布局，由 epilogue 按 `dst_buffer_slot_idx` 定位。
 - copy engine 模式需要 CPU sync（`do_cpu_sync=True`，默认）；无 CPU sync、CUDA graph 捕获时退回 SM 直写路径。
 - host 内存模式初始化时需要可写的临时目录（`tempfile.mkdtemp`），运行后自动删除。
-- 同一 NUMA 内的小规模 EP（EP≤4）不需要这两种模式，默认的 SM 直写更快。
+- 两种模式只对 EP > 4 生效：EP≤4 时即使设置了 `EP_PCIE_CE` / `EP_PCIE_SHM` 也会被忽略（rank 0 打印提示），始终走 SM 直写路径（更快，如 EP4 top-k 8 combine：SM 7.4 ms，CE 10.1 ms，SHM 10.0 ms）。
 - 与 PyTorch NCCL `all_to_all` 对比时，每个对端的分块需按 4 KB 对齐，否则 NCCL 会慢 2 倍以上（例如 150.3 MB/rank 不对齐时仅约 8.6 GB/s）。
 
 ## 技术细节

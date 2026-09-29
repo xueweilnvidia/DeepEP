@@ -373,15 +373,20 @@ class ElasticBuffer:
         # Physical rank indices
         self.num_rdma_ranks, self.num_nvlink_ranks = self.get_physical_domain_size()
 
+        # PCIe copy-engine/host-memory send is only for EP > 4, smaller EPs always use the SM path (faster there)
+        use_pcie_send = self.num_ranks > 4 and self.num_rdma_ranks == 1 and self.num_scaleout_ranks == 1
+        if (int(os.environ.get('EP_PCIE_CE', 0)) or int(os.environ.get('EP_PCIE_SHM', 0))) and self.num_ranks <= 4 and self.rank_idx == 0:
+            print(f'[DeepEP] EP_PCIE_CE/EP_PCIE_SHM are ignored with {self.num_ranks} ranks (<= 4), using the SM path', flush=True)
+
         # PCIe copy-engine send: exchange legacy IPC handles of the landing buffers
         # NOTES: legacy IPC works only within a node, and the copy-engine path supports only the single-scaleout mode
-        if int(os.environ.get('EP_PCIE_CE', 0)) and self.num_rdma_ranks == 1 and self.num_scaleout_ranks == 1:
+        if int(os.environ.get('EP_PCIE_CE', 0)) and use_pcie_send:
             handles = [None] * self.num_ranks
             dist.all_gather_object(handles, self.runtime.get_pcie_landing_handle(), self.group)
             self.runtime.set_pcie_landing_handles(handles)
 
         # PCIe host-memory send: exchange the host segments' FDs over Unix sockets in a private directory (single node only)
-        if int(os.environ.get('EP_PCIE_SHM', 0)) and self.num_rdma_ranks == 1 and self.num_scaleout_ranks == 1:
+        if int(os.environ.get('EP_PCIE_SHM', 0)) and use_pcie_send:
             socket_dirs = [None] * self.num_ranks
             dist.all_gather_object(socket_dirs, tempfile.mkdtemp(prefix='deep_ep_pcie_shm_') if self.rank_idx == 0 else None, self.group)
             handles = [None] * self.num_ranks
